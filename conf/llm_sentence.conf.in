@@ -1,0 +1,14 @@
+[Addon]
+Name=LLM Sentence Input
+Name[zh_CN]=大模型整句拼音输入
+Comment=Background LLM full-sentence pinyin conversion and in-place replacement for Fcitx 5
+Comment[zh_CN]=后台常驻的大模型整句拼音转换与原地退格替换模块（不占用输入法名额）
+Category=Module
+Library=libllm_sentence
+Type=SharedLibrary
+Version=@PROJECT_VERSION@
+OnDemand=False
+Configurable=True
+
+[Addon/Dependencies]
+0=core:@FCITX_CORE_DEP@
