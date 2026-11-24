@@ -125,6 +125,7 @@ void CandidateOverlay::update(const OverlayModel &model, const RECT &anchorRect)
         visible_ = true;
     }
     ::InvalidateRect(hwnd_, nullptr, FALSE);
+    ::UpdateWindow(hwnd_);
 }
 
 void CandidateOverlay::hide() {
@@ -141,17 +142,20 @@ LRESULT CALLBACK CandidateOverlay::wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARA
     if (msg == WM_NCCREATE) {
         auto *cs = reinterpret_cast<CREATESTRUCTW *>(lp);
         self = reinterpret_cast<CandidateOverlay *>(cs->lpCreateParams);
+        if (self) {
+            self->hwnd_ = hwnd;
+        }
         ::SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
     } else {
         self = reinterpret_cast<CandidateOverlay *>(::GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     }
     if (self) {
-        return self->handleMessage(msg, wp, lp);
+        return self->handleMessage(hwnd, msg, wp, lp);
     }
     return ::DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-LRESULT CandidateOverlay::handleMessage(UINT msg, WPARAM wp, LPARAM lp) {
+LRESULT CandidateOverlay::handleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE;
@@ -159,9 +163,9 @@ LRESULT CandidateOverlay::handleMessage(UINT msg, WPARAM wp, LPARAM lp) {
         return 1;
     case WM_PAINT: {
         PAINTSTRUCT ps{};
-        HDC hdc = ::BeginPaint(hwnd_, &ps);
-        paint(hdc);
-        ::EndPaint(hwnd_, &ps);
+        HDC hdc = ::BeginPaint(hwnd, &ps);
+        paint(hwnd, hdc);
+        ::EndPaint(hwnd, &ps);
         return 0;
     }
     case WM_MOUSEMOVE: {
@@ -169,7 +173,7 @@ LRESULT CandidateOverlay::handleMessage(UINT msg, WPARAM wp, LPARAM lp) {
         const int hit = hitTestCandidate(pt);
         if (hit != hoverIndex_) {
             hoverIndex_ = hit;
-            ::InvalidateRect(hwnd_, nullptr, FALSE);
+            ::InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
     }
@@ -182,7 +186,7 @@ LRESULT CandidateOverlay::handleMessage(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     default:
-        return ::DefWindowProcW(hwnd_, msg, wp, lp);
+        return ::DefWindowProcW(hwnd, msg, wp, lp);
     }
 }
 
@@ -328,7 +332,12 @@ void CandidateOverlay::recomputeLayoutAndMove(const RECT &anchorRect) {
                    SWP_NOACTIVATE | SWP_NOOWNERZORDER);
 }
 
-void CandidateOverlay::paint(HDC hdc) {
+void CandidateOverlay::paint(HWND hwnd, HDC hdc) {
+    RECT clientRc{};
+    ::GetClientRect(hwnd, &clientRc);
+    const int drawW = std::max(1, static_cast<int>(clientRc.right - clientRc.left));
+    const int drawH = std::max(1, static_cast<int>(clientRc.bottom - clientRc.top));
+
     const bool dark = isSystemDarkMode();
     const COLORREF bgCol = dark ? RGB(32, 33, 36) : RGB(252, 252, 253);
     const COLORREF borderCol = dark ? RGB(66, 70, 78) : RGB(214, 218, 224);
@@ -341,10 +350,10 @@ void CandidateOverlay::paint(HDC hdc) {
     const COLORREF sepCol = dark ? RGB(52, 56, 64) : RGB(232, 235, 240);
 
     HDC memDc = ::CreateCompatibleDC(hdc);
-    HBITMAP bmp = ::CreateCompatibleBitmap(hdc, width_, height_);
+    HBITMAP bmp = ::CreateCompatibleBitmap(hdc, drawW, drawH);
     HGDIOBJ oldBmp = ::SelectObject(memDc, bmp);
 
-    RECT full{0, 0, width_, height_};
+    RECT full{0, 0, drawW, drawH};
     HBRUSH bgBrush = ::CreateSolidBrush(bgCol);
     ::FillRect(memDc, &full, bgBrush);
     ::DeleteObject(bgBrush);
@@ -352,7 +361,7 @@ void CandidateOverlay::paint(HDC hdc) {
     HPEN borderPen = ::CreatePen(PS_SOLID, 1, borderCol);
     HGDIOBJ oldPen = ::SelectObject(memDc, borderPen);
     HGDIOBJ oldBrush = ::SelectObject(memDc, ::GetStockObject(HOLLOW_BRUSH));
-    ::Rectangle(memDc, 0, 0, width_, height_);
+    ::Rectangle(memDc, 0, 0, drawW, drawH);
     ::SelectObject(memDc, oldBrush);
     ::SelectObject(memDc, oldPen);
     ::DeleteObject(borderPen);
@@ -456,7 +465,7 @@ void CandidateOverlay::paint(HDC hdc) {
         ::SelectObject(memDc, sf);
     }
 
-    ::BitBlt(hdc, 0, 0, width_, height_, memDc, 0, 0, SRCCOPY);
+    ::BitBlt(hdc, 0, 0, drawW, drawH, memDc, 0, 0, SRCCOPY);
 
     ::DeleteObject(preeditFont);
     ::DeleteObject(candFont);

@@ -45,9 +45,9 @@ public:
 
 private:
     static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
-    LRESULT handleMessage(UINT msg, WPARAM wp, LPARAM lp);
+    LRESULT handleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
     void recomputeLayoutAndMove(const RECT &anchorRect);
-    void paint(HDC hdc);
+    void paint(HWND hwnd, HDC hdc);
     int hitTestCandidate(POINT pt) const;
 
     HWND hwnd_ = nullptr;

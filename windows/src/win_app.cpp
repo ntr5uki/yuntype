@@ -30,6 +30,7 @@ constexpr UINT WM_YT_PASSIVE_KEY = WM_APP + 4;
 constexpr UINT WM_YT_FG_CHANGED = WM_APP + 5;
 constexpr UINT WM_YT_RELOAD_CONFIG = WM_APP + 6;
 constexpr UINT WM_YT_CLEAR_HISTORY = WM_APP + 7;
+constexpr UINT WM_YT_MOUSE_CLICK = WM_APP + 8;
 
 constexpr UINT IDM_TOGGLE_ENABLED = 3001;
 constexpr UINT IDM_OPEN_SETTINGS = 3002;
@@ -522,6 +523,9 @@ LRESULT CALLBACK WinApp::ctrlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     case WM_YT_FG_CHANGED:
         self->onForegroundChanged(reinterpret_cast<HWND>(wp));
         return 0;
+    case WM_YT_MOUSE_CLICK:
+        self->onMouseClick(POINT{static_cast<LONG>(wp), static_cast<LONG>(lp)});
+        return 0;
     case WM_YT_RELOAD_CONFIG:
         self->reloadConfigAndSync();
         return 0;
@@ -550,12 +554,19 @@ LRESULT CALLBACK WinApp::lowLevelKeyboardProc(int code, WPARAM wp, LPARAM lp) {
     if ((kb->flags & LLKHF_INJECTED) != 0 || kb->dwExtraInfo == kYunTypeInjectedTag) {
         return ::CallNextHookEx(nullptr, code, wp, lp);
     }
+    const DWORD vk = kb->vkCode;
     const bool isDown = (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN);
+    const bool isUp = (wp == WM_KEYUP || wp == WM_SYSKEYUP);
+
+    // Swallow matching keyup of trigger hotkey and clear anti-repeat guard
+    if (isUp && self->triggerKeyHeld_ && vk == self->triggerSpec_.vk) {
+        self->triggerKeyHeld_ = false;
+        return 1;
+    }
     if (!isDown) {
         return ::CallNextHookEx(nullptr, code, wp, lp);
     }
 
-    const DWORD vk = kb->vkCode;
     if (isModifierVk(vk)) {
         return ::CallNextHookEx(nullptr, code, wp, lp);
     }
@@ -567,6 +578,13 @@ LRESULT CALLBACK WinApp::lowLevelKeyboardProc(int code, WPARAM wp, LPARAM lp) {
     const char ascii = (ctrl || alt) ? 0 : self->vkToPrintableAscii(vk, shift, caps);
 
     if (self->enabledAtomic_.load() && self->isTriggerMatch(vk)) {
+        if (self->triggerKeyHeld_) {
+            return 1; // Ignore key auto-repeat while trigger key is held
+        }
+        self->triggerKeyHeld_ = true;
+        if (alt) {
+            suppressAltMenuActivation();
+        }
         ::PostMessageW(self->ctrlHwnd_, WM_YT_TRIGGER, 0, 0);
         return 1; // Swallow trigger hotkey
     }
@@ -589,6 +607,10 @@ LRESULT CALLBACK WinApp::lowLevelMouseProc(int code, WPARAM wp, LPARAM lp) {
     if (code == HC_ACTION && self && wp == WM_LBUTTONDOWN) {
         const auto *ms = reinterpret_cast<const MSLLHOOKSTRUCT *>(lp);
         self->lastClickPt_ = ms->pt;
+        if (self->ctrlHwnd_) {
+            ::PostMessageW(self->ctrlHwnd_, WM_YT_MOUSE_CLICK,
+                           static_cast<WPARAM>(ms->pt.x), static_cast<LPARAM>(ms->pt.y));
+        }
     }
     return ::CallNextHookEx(nullptr, code, wp, lp);
 }
@@ -605,13 +627,28 @@ void WinApp::onForegroundChanged(HWND newFg) {
     }
     if (newFg != lastFgWnd_) {
         if (hasActiveSession()) {
-            resetActiveSession(false);
+            resetActiveSession();
         }
         appAscii_.clear();
         historyDraft_.reset();
         shadowDraft_.reset();
         lastFgWnd_ = newFg;
     }
+}
+
+void WinApp::onMouseClick(POINT pt) {
+    // Clicking anywhere invalidates tracked ASCII pinyin buffer (caret may have moved)
+    appAscii_.clear();
+    if (!hasActiveSession()) {
+        return;
+    }
+    if (overlay_.isVisible() && overlay_.hwnd()) {
+        RECT ovRc{};
+        if (::GetWindowRect(overlay_.hwnd(), &ovRc) && ::PtInRect(&ovRc, pt)) {
+            return; // Click is inside the overlay (candidate selection)
+        }
+    }
+    resetActiveSession();
 }
 
 void WinApp::onTrigger() {
@@ -625,12 +662,18 @@ void WinApp::onTrigger() {
     if (draftActive_) {
         if (!draft_.empty()) {
             std::string q = std::move(draft_);
+            const std::size_t eraseChars = draftEraseChars_;
+            std::string eraseSuffix = std::move(draftEraseSuffix_);
             draft_.clear();
             draftCursor_ = 0;
+            draftEraseChars_ = 0;
+            draftEraseSuffix_.clear();
             draftActive_ = false;
-            submitSentence(std::move(q), false);
+            submitSentence(std::move(q), eraseChars, std::move(eraseSuffix));
         } else {
             draftActive_ = false;
+            draftEraseChars_ = 0;
+            draftEraseSuffix_.clear();
             activeSessionAtomic_.store(hasActiveSession());
             refreshOverlay();
         }
@@ -641,27 +684,32 @@ void WinApp::onTrigger() {
     lastFgWnd_ = fg;
     activeAnchor_ = caret_.queryCaret(fg, lastClickPt_).rect;
 
-    // 1. Try in-place replacement of recently typed ASCII pinyin suffix
+    // 1. Check recently typed ASCII pinyin suffix (verify against UIA surrounding when available
+    //    so Microsoft Pinyin Chinese text or previously committed English is never deleted!)
     std::string suffix = yuntype::extractReplaceablePinyinSuffix(appAscii_);
-    if (suffix.empty()) {
+    if (!suffix.empty()) {
         if (auto snap = caret_.readSurrounding(fg)) {
             if (snap->start == snap->end && snap->start > 0) {
-                suffix = yuntype::extractReplaceablePinyinSuffix(
-                    std::string_view(snap->text).substr(0, snap->start));
+                const std::string_view beforeCaret =
+                    std::string_view(snap->text).substr(0, snap->start);
+                if (!beforeCaret.ends_with(suffix)) {
+                    // Text before caret doesn't end with our tracked ASCII (e.g. converted by another IME)
+                    suffix.clear();
+                    appAscii_.clear();
+                }
+            } else if (snap->start == 0) {
+                suffix.clear();
+                appAscii_.clear();
             }
         }
     }
+
     if (!suffix.empty()) {
         const std::size_t eraseCount = yuntype::utf8Length(suffix);
+        std::string eraseSuffix = suffix;
         appAscii_.clear();
-        if (config_.historyEnabled && shadowDraft_) {
-            if (history_.shadowEraseSuffixBeforeCursor(shadowDraft_, suffix, ++historyRevision_,
-                                                       monotonicNowUsec(), kShadowTimeoutUsec)) {
-                onHistoryMutated();
-            }
-        }
-        sendBackspaces(eraseCount);
-        submitSentence(std::move(suffix), true);
+        // Deferred atomic replacement: keep text intact until commit!
+        submitSentence(std::move(suffix), eraseCount, std::move(eraseSuffix));
         return;
     }
 
@@ -669,6 +717,8 @@ void WinApp::onTrigger() {
     draftActive_ = true;
     draft_.clear();
     draftCursor_ = 0;
+    draftEraseChars_ = 0;
+    draftEraseSuffix_.clear();
     activeSessionAtomic_.store(true);
     refreshOverlay();
 }
@@ -769,17 +819,23 @@ void WinApp::handleDraftKey(DWORD vk, bool ctrl, char asciiCh) {
         draftActive_ = false;
         draft_.clear();
         draftCursor_ = 0;
+        draftEraseChars_ = 0;
+        draftEraseSuffix_.clear();
         activeSessionAtomic_.store(hasActiveSession());
         refreshOverlay();
         return;
     }
     if (vk == VK_RETURN) {
         std::string q = std::move(draft_);
+        const std::size_t eraseChars = draftEraseChars_;
+        std::string eraseSuffix = std::move(draftEraseSuffix_);
         draft_.clear();
         draftCursor_ = 0;
+        draftEraseChars_ = 0;
+        draftEraseSuffix_.clear();
         draftActive_ = false;
         if (!q.empty()) {
-            submitSentence(std::move(q), false);
+            submitSentence(std::move(q), eraseChars, std::move(eraseSuffix));
         } else {
             activeSessionAtomic_.store(hasActiveSession());
             refreshOverlay();
@@ -792,6 +848,8 @@ void WinApp::handleDraftKey(DWORD vk, bool ctrl, char asciiCh) {
             --draftCursor_;
         } else if (draft_.empty()) {
             draftActive_ = false;
+            draftEraseChars_ = 0;
+            draftEraseSuffix_.clear();
             activeSessionAtomic_.store(hasActiveSession());
         }
         refreshOverlay();
@@ -836,14 +894,22 @@ void WinApp::handleDraftKey(DWORD vk, bool ctrl, char asciiCh) {
 
 void WinApp::handleQueueKey(DWORD vk, char asciiCh) {
     if (vk == VK_ESCAPE) {
-        resetActiveSession(true);
+        resetActiveSession();
         return;
     }
     if (vk == VK_RETURN && !queue_.empty()) {
         std::string fallback = queue_.front().fallback;
+        const std::size_t eraseChars = queue_.front().pendingEraseChars;
+        std::string eraseSuffix = queue_.front().pendingEraseSuffix;
         client_.cancelSentence();
         queue_.pop_front();
-        commitSentenceResult(std::move(fallback), {}, 0, {}, false);
+        // If text is already in the app and equals fallback, just close without rewriting!
+        if (eraseChars > 0 && fallback == eraseSuffix) {
+            activeSessionAtomic_.store(hasActiveSession());
+            refreshOverlay();
+            return;
+        }
+        commitSentenceResult(std::move(fallback), {}, 0, {}, false, eraseChars, eraseSuffix);
         activeSessionAtomic_.store(hasActiveSession());
         refreshOverlay();
         return;
@@ -862,7 +928,7 @@ void WinApp::handleCandidateKey(DWORD vk, bool shift, bool ctrl, char asciiCh) {
     const int totalPages = std::max(1, (total + pageSize - 1) / pageSize);
 
     if (vk == VK_ESCAPE) {
-        resetActiveSession(true);
+        resetActiveSession();
         return;
     }
     if (vk == VK_BACK) {
@@ -871,6 +937,8 @@ void WinApp::handleCandidateKey(DWORD vk, bool shift, bool ctrl, char asciiCh) {
         }
         draft_ = pc.query;
         draftCursor_ = draft_.size();
+        draftEraseChars_ = pc.pendingEraseChars;
+        draftEraseSuffix_ = std::move(pc.pendingEraseSuffix);
         draftActive_ = true;
         pendingCandidates_.reset();
         activeSessionAtomic_.store(true);
@@ -943,12 +1011,14 @@ void WinApp::handleCandidateKey(DWORD vk, bool shift, bool ctrl, char asciiCh) {
     }
 }
 
-void WinApp::submitSentence(std::string query, bool erasedFromApp) {
+void WinApp::submitSentence(std::string query, std::size_t pendingEraseChars,
+                            std::string pendingEraseSuffix) {
     const bool needsLlm = yuntype::hasAsciiAlpha(query);
     queue_.push_back(SubmittedSentence{
         query,
         query,
-        erasedFromApp,
+        pendingEraseChars,
+        std::move(pendingEraseSuffix),
         false,
         needsLlm ? std::nullopt : std::optional<std::string>(query),
         std::nullopt,
@@ -1027,8 +1097,11 @@ void WinApp::commitPendingCandidate(int globalIndex) {
     if (pc.loadingMore) {
         client_.cancelSentence();
     }
+    activeSessionAtomic_.store(hasActiveSession());
+    if (!hasActiveSession()) {
+        overlay_.hide();
+    }
     if (pc.candidates.empty()) {
-        activeSessionAtomic_.store(hasActiveSession());
         refreshOverlay();
         return;
     }
@@ -1036,21 +1109,43 @@ void WinApp::commitPendingCandidate(int globalIndex) {
         static_cast<std::size_t>(std::clamp(globalIndex, 0, static_cast<int>(pc.candidates.size()) - 1));
     const std::string chosen = pc.candidates[idx];
     const std::string firstCand = pc.candidates.front();
-    commitSentenceResult(chosen, {}, pc.sentRev, firstCand, true);
-    activeSessionAtomic_.store(hasActiveSession());
+    commitSentenceResult(chosen, {}, pc.sentRev, firstCand, true, pc.pendingEraseChars,
+                         pc.pendingEraseSuffix);
     refreshOverlay();
 }
 
 void WinApp::commitSentenceResult(std::string committed, std::string turnJson,
                                   std::uint64_t sentRev, std::string_view llmOriginal,
-                                  bool candidateMode) {
+                                  bool candidateMode, std::size_t eraseChars,
+                                  std::string_view eraseSuffix) {
+    appAscii_.clear();
+    if (!hasActiveSession()) {
+        overlay_.hide();
+    }
     HWND fg = lastFgWnd_ ? lastFgWnd_ : ::GetForegroundWindow();
     const bool allowHistory =
         config_.historyEnabled &&
         ((turnJson.empty() && !candidateMode) || sentRev >= historyClearedAt_);
     if (allowHistory) {
-        auto snap = caret_.readSurrounding(fg);
         const std::uint64_t now = monotonicNowUsec();
+        if (eraseChars > 0 && !eraseSuffix.empty() && shadowDraft_) {
+            if (history_.shadowEraseSuffixBeforeCursor(shadowDraft_, eraseSuffix,
+                                                       ++historyRevision_, now,
+                                                       kShadowTimeoutUsec)) {
+                onHistoryMutated();
+            }
+        }
+        auto snap = caret_.readSurrounding(fg);
+        if (snap && eraseChars > 0 && !eraseSuffix.empty() && snap->start == snap->end &&
+            snap->start >= eraseSuffix.size()) {
+            const std::size_t suffixStart = snap->start - eraseSuffix.size();
+            if (std::string_view(snap->text).substr(suffixStart, eraseSuffix.size()) ==
+                eraseSuffix) {
+                snap->text.erase(suffixStart, eraseSuffix.size());
+                snap->start = suffixStart;
+                snap->end = suffixStart;
+            }
+        }
         if (candidateMode) {
             if (history_.recordShortCommit(historyDraft_, shadowDraft_, snap, committed,
                                            ++historyRevision_, now, kShadowTimeoutUsec,
@@ -1067,7 +1162,7 @@ void WinApp::commitSentenceResult(std::string committed, std::string turnJson,
             onHistoryMutated();
         }
     }
-    sendUnicodeText(committed);
+    sendReplaceText(eraseChars, committed);
     lastCommitUsec_ = monotonicNowUsec();
 }
 
@@ -1150,9 +1245,11 @@ void WinApp::pollQueue() {
     if (!front.started) {
         if (front.ready) {
             std::string out = std::move(*front.ready);
+            const std::size_t eraseChars = front.pendingEraseChars;
+            std::string eraseSuffix = std::move(front.pendingEraseSuffix);
             queue_.pop_front();
-            commitSentenceResult(std::move(out), {}, 0, {}, false);
             activeSessionAtomic_.store(hasActiveSession());
+            commitSentenceResult(std::move(out), {}, 0, {}, false, eraseChars, eraseSuffix);
             refreshOverlay();
             return;
         }
@@ -1185,7 +1282,8 @@ void WinApp::pollQueue() {
         std::string finalText = std::move(snap.text);
         const std::string query = front.query;
         const std::string fallback = front.fallback;
-        const bool erased = front.erasedFromApp;
+        const std::size_t eraseChars = front.pendingEraseChars;
+        std::string eraseSuffix = std::move(front.pendingEraseSuffix);
         queue_.pop_front();
         client_.cancelSentence();
 
@@ -1193,7 +1291,8 @@ void WinApp::pollQueue() {
             PendingCandidates pc;
             pc.query = query;
             pc.fallback = fallback;
-            pc.erasedFromApp = erased;
+            pc.pendingEraseChars = eraseChars;
+            pc.pendingEraseSuffix = std::move(eraseSuffix);
             pc.candidates = std::move(cands);
             pc.sentRev = sentRev;
             pc.globalCursor = 0;
@@ -1205,9 +1304,9 @@ void WinApp::pollQueue() {
             refreshOverlay();
         } else {
             const std::string committed = !cands.empty() ? cands.front() : finalText;
-            commitSentenceResult(committed, candMode ? std::string{} : std::move(turnJson),
-                                 sentRev, {}, candMode);
             activeSessionAtomic_.store(hasActiveSession());
+            commitSentenceResult(committed, candMode ? std::string{} : std::move(turnJson),
+                                 sentRev, {}, candMode, eraseChars, eraseSuffix);
             refreshOverlay();
         }
     }
@@ -1294,26 +1393,17 @@ void WinApp::refreshOverlay() {
     overlay_.update(model, activeAnchor_);
 }
 
-void WinApp::resetActiveSession(bool restorePinyin) {
-    std::string toRestore;
-    if (restorePinyin) {
-        if (pendingCandidates_ && pendingCandidates_->erasedFromApp) {
-            toRestore = pendingCandidates_->fallback;
-        } else if (!queue_.empty() && queue_.front().erasedFromApp) {
-            toRestore = queue_.front().fallback;
-        }
-    }
+void WinApp::resetActiveSession() {
     client_.cancelSentence();
     draftActive_ = false;
     draft_.clear();
     draftCursor_ = 0;
+    draftEraseChars_ = 0;
+    draftEraseSuffix_.clear();
     queue_.clear();
     pendingCandidates_.reset();
     activeSessionAtomic_.store(false);
     overlay_.hide();
-    if (!toRestore.empty()) {
-        sendUnicodeText(toRestore);
-    }
 }
 
 } // namespace yuntype::win

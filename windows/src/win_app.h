@@ -26,7 +26,8 @@ namespace yuntype::win {
 struct SubmittedSentence {
     std::string query;
     std::string fallback;
-    bool erasedFromApp = false;
+    std::size_t pendingEraseChars = 0;
+    std::string pendingEraseSuffix;
     bool started = false;
     std::optional<std::string> ready;
     std::optional<std::string> error;
@@ -35,7 +36,8 @@ struct SubmittedSentence {
 struct PendingCandidates {
     std::string query;
     std::string fallback;
-    bool erasedFromApp = false;
+    std::size_t pendingEraseChars = 0;
+    std::string pendingEraseSuffix;
     std::vector<std::string> candidates;
     std::uint64_t sentRev = 0;
     int globalCursor = 0;
@@ -84,24 +86,27 @@ private:
     void onActiveKey(DWORD vk, bool shift, bool ctrl, bool alt, char asciiCh);
     void onPassiveKey(DWORD vk, bool shift, bool ctrl, bool alt, char asciiCh);
     void onForegroundChanged(HWND newFg);
+    void onMouseClick(POINT pt);
 
     void handleDraftKey(DWORD vk, bool ctrl, char asciiCh);
     void handleQueueKey(DWORD vk, char asciiCh);
     void handleCandidateKey(DWORD vk, bool shift, bool ctrl, char asciiCh);
 
-    void submitSentence(std::string query, bool erasedFromApp);
+    void submitSentence(std::string query, std::size_t pendingEraseChars,
+                        std::string pendingEraseSuffix);
     void startLoadMoreCandidates();
     void commitPendingCandidate(int globalIndex);
     void commitSentenceResult(std::string committed, std::string turnJson,
                               std::uint64_t sentRev, std::string_view llmOriginal,
-                              bool candidateMode);
+                              bool candidateMode, std::size_t eraseChars,
+                              std::string_view eraseSuffix);
 
     yuntype::SentenceContext buildHistoryContext(bool candidateMode);
     void pollTimers();
     void pollQueue();
     void pollCompaction();
     void refreshOverlay();
-    void resetActiveSession(bool restorePinyin);
+    void resetActiveSession();
 
     HINSTANCE hInst_ = nullptr;
     HWND ctrlHwnd_ = nullptr;
@@ -120,6 +125,7 @@ private:
 
     std::atomic<bool> enabledAtomic_{true};
     std::atomic<bool> activeSessionAtomic_{false};
+    bool triggerKeyHeld_ = false;
 
     CaretTracker caret_;
     CandidateOverlay overlay_;
@@ -145,6 +151,8 @@ private:
     bool draftActive_ = false;
     std::string draft_;
     std::size_t draftCursor_ = 0;
+    std::size_t draftEraseChars_ = 0;
+    std::string draftEraseSuffix_;
     std::deque<SubmittedSentence> queue_;
     std::optional<PendingCandidates> pendingCandidates_;
     std::uint64_t lastCommitUsec_ = 0;
