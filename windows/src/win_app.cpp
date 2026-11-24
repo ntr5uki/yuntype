@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <filesystem>
 
 namespace yuntype::win {
@@ -23,6 +24,8 @@ constexpr UINT kPollIntervalMs = 40;
 constexpr std::size_t kMaxAsciiTrackBytes = 512;
 constexpr int kMaxLoadMoreRounds = 5;
 constexpr std::uint64_t kShadowTimeoutUsec = 30ULL * 1000 * 1000;
+constexpr std::uint64_t kWindowAsciiTtlUsec = 60ULL * 1000 * 1000;
+constexpr std::size_t kMaxSavedWindowAscii = 16;
 
 constexpr UINT WM_YT_TRAY = WM_APP + 1;
 constexpr UINT WM_YT_TRIGGER = WM_APP + 2;
@@ -32,12 +35,28 @@ constexpr UINT WM_YT_FG_CHANGED = WM_APP + 5;
 constexpr UINT WM_YT_RELOAD_CONFIG = WM_APP + 6;
 constexpr UINT WM_YT_CLEAR_HISTORY = WM_APP + 7;
 constexpr UINT WM_YT_MOUSE_CLICK = WM_APP + 8;
+constexpr UINT WM_YT_MOUSE_UP = WM_APP + 9;
 
 constexpr UINT IDM_TOGGLE_ENABLED = 3001;
 constexpr UINT IDM_OPEN_SETTINGS = 3002;
 constexpr UINT IDM_CLEAR_HISTORY = 3003;
 constexpr UINT IDM_AUTO_START = 3004;
 constexpr UINT IDM_EXIT = 3005;
+
+bool isPointInWindowClient(HWND hwnd, POINT pt) {
+    if (!hwnd || !::IsWindow(hwnd)) {
+        return false;
+    }
+    POINT local = pt;
+    if (!::ScreenToClient(hwnd, &local)) {
+        return false;
+    }
+    RECT rc{};
+    if (!::GetClientRect(hwnd, &rc)) {
+        return false;
+    }
+    return ::PtInRect(&rc, local) != FALSE;
+}
 
 bool isForegroundChineseImeActive() {
     HWND fg = ::GetForegroundWindow();
@@ -250,6 +269,7 @@ int WinApp::run(HINSTANCE hInst) {
     fgHook_ = ::SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
                                 &WinApp::winEventProc, 0, 0,
                                 WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    lastFgWnd_ = ::GetForegroundWindow();
 
     ::SetTimer(ctrlHwnd_, kTimerPollId, kPollIntervalMs, nullptr);
 
@@ -570,6 +590,9 @@ LRESULT CALLBACK WinApp::ctrlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     case WM_YT_MOUSE_CLICK:
         self->onMouseClick(POINT{static_cast<LONG>(wp), static_cast<LONG>(lp)});
         return 0;
+    case WM_YT_MOUSE_UP:
+        self->onMouseUp(POINT{static_cast<LONG>(wp), static_cast<LONG>(lp)});
+        return 0;
     case WM_YT_RELOAD_CONFIG:
         self->reloadConfigAndSync();
         return 0;
@@ -653,12 +676,20 @@ LRESULT CALLBACK WinApp::lowLevelKeyboardProc(int code, WPARAM wp, LPARAM lp) {
 
 LRESULT CALLBACK WinApp::lowLevelMouseProc(int code, WPARAM wp, LPARAM lp) {
     WinApp *self = instance_;
-    if (code == HC_ACTION && self && wp == WM_LBUTTONDOWN) {
-        const auto *ms = reinterpret_cast<const MSLLHOOKSTRUCT *>(lp);
-        self->lastClickPt_ = ms->pt;
-        if (self->ctrlHwnd_) {
-            ::PostMessageW(self->ctrlHwnd_, WM_YT_MOUSE_CLICK,
-                           static_cast<WPARAM>(ms->pt.x), static_cast<LPARAM>(ms->pt.y));
+    if (code == HC_ACTION && self) {
+        if (wp == WM_LBUTTONDOWN) {
+            const auto *ms = reinterpret_cast<const MSLLHOOKSTRUCT *>(lp);
+            self->lastClickPt_ = ms->pt;
+            if (self->ctrlHwnd_) {
+                ::PostMessageW(self->ctrlHwnd_, WM_YT_MOUSE_CLICK,
+                               static_cast<WPARAM>(ms->pt.x), static_cast<LPARAM>(ms->pt.y));
+            }
+        } else if (wp == WM_LBUTTONUP) {
+            const auto *ms = reinterpret_cast<const MSLLHOOKSTRUCT *>(lp);
+            if (self->ctrlHwnd_) {
+                ::PostMessageW(self->ctrlHwnd_, WM_YT_MOUSE_UP,
+                               static_cast<WPARAM>(ms->pt.x), static_cast<LPARAM>(ms->pt.y));
+            }
         }
     }
     return ::CallNextHookEx(nullptr, code, wp, lp);
@@ -667,6 +698,30 @@ LRESULT CALLBACK WinApp::lowLevelMouseProc(int code, WPARAM wp, LPARAM lp) {
 void CALLBACK WinApp::winEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG, LONG, DWORD, DWORD) {
     if (event == EVENT_SYSTEM_FOREGROUND && instance_ && instance_->ctrlHwnd_) {
         ::PostMessageW(instance_->ctrlHwnd_, WM_YT_FG_CHANGED, reinterpret_cast<WPARAM>(hwnd), 0);
+    }
+}
+
+void WinApp::saveWindowAscii(HWND hwnd) {
+    if (!hwnd || appAscii_.empty()) {
+        return;
+    }
+    const std::uint64_t now = monotonicNowUsec();
+    savedWindowAscii_[hwnd] = SavedWindowAscii{appAscii_, now};
+    for (auto it = savedWindowAscii_.begin(); it != savedWindowAscii_.end();) {
+        if (now >= it->second.savedUsec && (now - it->second.savedUsec) > kWindowAsciiTtlUsec) {
+            it = savedWindowAscii_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    while (savedWindowAscii_.size() > kMaxSavedWindowAscii) {
+        auto oldest = savedWindowAscii_.begin();
+        for (auto it = savedWindowAscii_.begin(); it != savedWindowAscii_.end(); ++it) {
+            if (it->second.savedUsec < oldest->second.savedUsec) {
+                oldest = it;
+            }
+        }
+        savedWindowAscii_.erase(oldest);
     }
 }
 
@@ -679,27 +734,87 @@ void WinApp::onForegroundChanged(HWND newFg) {
         if (hasActiveSession()) {
             resetActiveSession();
         }
+        saveWindowAscii(lastFgWnd_);
         appAscii_.clear();
+        selectionLikely_ = false;
         lastCommittedText_.clear();
         historyDraft_.reset();
         shadowDraft_.reset();
         lastFgWnd_ = newFg;
+        if (newFg) {
+            auto it = savedWindowAscii_.find(newFg);
+            if (it != savedWindowAscii_.end()) {
+                const std::uint64_t now = monotonicNowUsec();
+                if (now >= it->second.savedUsec &&
+                    (now - it->second.savedUsec) <= kWindowAsciiTtlUsec) {
+                    appAscii_ = std::move(it->second.text);
+                }
+                savedWindowAscii_.erase(it);
+            }
+        }
     }
 }
 
 void WinApp::onMouseClick(POINT pt) {
-    // Clicking anywhere invalidates tracked ASCII pinyin buffer (caret may have moved)
-    appAscii_.clear();
-    if (!hasActiveSession()) {
-        return;
-    }
     if (overlay_.isVisible() && overlay_.hwnd()) {
         RECT ovRc{};
         if (::GetWindowRect(overlay_.hwnd(), &ovRc) && ::PtInRect(&ovRc, pt)) {
             return; // Click is inside the overlay (candidate selection)
         }
     }
-    resetActiveSession();
+
+    const std::uint64_t nowMs = ::GetTickCount64();
+    const bool isDblClick =
+        lastClickMs_ != 0 && nowMs >= lastClickMs_ &&
+        (nowMs - lastClickMs_) <= ::GetDoubleClickTime() &&
+        std::abs(pt.x - prevClickPt_.x) <= 4 && std::abs(pt.y - prevClickPt_.y) <= 4;
+    lastClickMs_ = nowMs;
+    prevClickPt_ = pt;
+
+    HWND hitWnd = ::WindowFromPoint(pt);
+    HWND hitRoot = hitWnd ? ::GetAncestor(hitWnd, GA_ROOT) : nullptr;
+    HWND activeFg = lastFgWnd_ ? lastFgWnd_ : ::GetForegroundWindow();
+    const bool inClient = hitRoot && isPointInWindowClient(hitRoot, pt);
+
+    mouseDownPt_ = pt;
+    mouseDownValid_ = true;
+    mouseDownInClient_ = inClient;
+    selectionLikely_ = isDblClick && inClient;
+
+    if (hitRoot && activeFg && hitRoot != activeFg) {
+        // Clicking a different window (or taskbar): save current window's pinyin buffer
+        // before foreground change arrives so Alt+Tab or clicking back restores it.
+        saveWindowAscii(activeFg);
+        appAscii_.clear();
+    } else if (inClient) {
+        // Clicking inside the active window's client area may reposition the caret.
+        appAscii_.clear();
+        if (activeFg) {
+            savedWindowAscii_.erase(activeFg);
+        }
+    }
+
+    if (hasActiveSession()) {
+        resetActiveSession();
+    }
+}
+
+void WinApp::onMouseUp(POINT pt) {
+    if (!mouseDownValid_) {
+        return;
+    }
+    const bool wasInClient = mouseDownInClient_;
+    const POINT downPt = mouseDownPt_;
+    mouseDownValid_ = false;
+    mouseDownInClient_ = false;
+    if (wasInClient &&
+        (std::abs(pt.x - downPt.x) > 4 || std::abs(pt.y - downPt.y) > 4)) {
+        selectionLikely_ = true;
+        appAscii_.clear();
+        if (lastFgWnd_) {
+            savedWindowAscii_.erase(lastFgWnd_);
+        }
+    }
 }
 
 void WinApp::onTrigger() {
@@ -735,18 +850,54 @@ void WinApp::onTrigger() {
     }
 
     HWND fg = ::GetForegroundWindow();
-    lastFgWnd_ = fg;
+    if (fg && fg != lastFgWnd_) {
+        saveWindowAscii(lastFgWnd_);
+        lastFgWnd_ = fg;
+        if (appAscii_.empty()) {
+            auto it = savedWindowAscii_.find(fg);
+            if (it != savedWindowAscii_.end()) {
+                const std::uint64_t now = monotonicNowUsec();
+                if (now >= it->second.savedUsec &&
+                    (now - it->second.savedUsec) <= kWindowAsciiTtlUsec) {
+                    appAscii_ = std::move(it->second.text);
+                }
+                savedWindowAscii_.erase(it);
+            }
+        }
+    }
     activeAnchor_ = caret_.queryCaret(fg, lastClickPt_).rect;
     auto snap = caret_.readSurrounding(fg);
 
-    // 1. Active selection (including Ctrl+A select-all): convert selected text directly
+    // 1. Active selection via UIA (including Ctrl+A select-all): convert selected text directly
     //    and overwrite in-place with zero BackSpaces!
     if (snap && snap->end > snap->start && snap->end <= snap->text.size()) {
         std::string selected = snap->text.substr(snap->start, snap->end - snap->start);
         if (yuntype::hasAsciiAlpha(selected)) {
+            selectionLikely_ = false;
             appAscii_.clear();
+            if (fg) {
+                savedWindowAscii_.erase(fg);
+            }
             submitSentence(std::move(selected), 0, {}, true);
             return;
+        }
+    }
+
+    // 1b. Active selection in non-UIA apps (WeChat, Notepad3/Scintilla, WPS):
+    //     Only fire silent Ctrl+C when an explicit selection gesture occurred (Ctrl+A,
+    //     Shift+navigation, mouse drag, or double/triple-click) so Scintilla never
+    //     accidentally copies an unselected line.
+    if (selectionLikely_) {
+        selectionLikely_ = false;
+        if (auto clipSel = readSelectionViaClipboard(fg)) {
+            if (yuntype::hasAsciiAlpha(*clipSel)) {
+                appAscii_.clear();
+                if (fg) {
+                    savedWindowAscii_.erase(fg);
+                }
+                submitSentence(std::move(*clipSel), 0, {}, true);
+                return;
+            }
         }
     }
 
@@ -810,16 +961,44 @@ void WinApp::onActiveKey(DWORD vk, bool shift, bool ctrl, bool alt, char asciiCh
 }
 
 void WinApp::onPassiveKey(DWORD vk, bool shift, bool ctrl, bool alt, char asciiCh) {
-    (void)shift;
     const std::uint64_t now = monotonicNowUsec();
+    if (!lastFgWnd_) {
+        lastFgWnd_ = ::GetForegroundWindow();
+    }
+
+    // Track explicit keyboard selection gestures (Ctrl+A, Shift+navigation, Ctrl+Shift+navigation)
+    // so non-UIA apps (WeChat, Notepad3, WPS) can read the selection via silent Ctrl+C on trigger.
+    if (ctrl && !alt && !shift && vk == 'A') {
+        selectionLikely_ = true;
+        appAscii_.clear();
+        if (lastFgWnd_) {
+            savedWindowAscii_.erase(lastFgWnd_);
+        }
+        return;
+    }
+    if (shift && !alt &&
+        (vk == VK_LEFT || vk == VK_RIGHT || vk == VK_UP || vk == VK_DOWN ||
+         vk == VK_HOME || vk == VK_END || vk == VK_PRIOR || vk == VK_NEXT)) {
+        selectionLikely_ = true;
+        appAscii_.clear();
+        if (lastFgWnd_) {
+            savedWindowAscii_.erase(lastFgWnd_);
+        }
+        return;
+    }
+
     if (ctrl || alt) {
         if (vk != VK_SHIFT && vk != VK_CONTROL && vk != VK_MENU) {
             appAscii_.clear();
+            if (!(ctrl && !alt && vk == 'C')) {
+                selectionLikely_ = false;
+            }
         }
         return;
     }
 
     if (asciiCh >= 0x20 && asciiCh <= 0x7E) {
+        selectionLikely_ = false;
         if (isForegroundChineseImeActive()) {
             appAscii_.clear();
             return;
@@ -840,6 +1019,7 @@ void WinApp::onPassiveKey(DWORD vk, bool shift, bool ctrl, bool alt, char asciiC
 
     switch (vk) {
     case VK_BACK:
+        selectionLikely_ = false;
         if (!appAscii_.empty()) {
             appAscii_.pop_back();
         }
@@ -851,6 +1031,7 @@ void WinApp::onPassiveKey(DWORD vk, bool shift, bool ctrl, bool alt, char asciiC
         }
         break;
     case VK_DELETE:
+        selectionLikely_ = false;
         appAscii_.clear();
         if (config_.historyEnabled && shadowDraft_) {
             if (history_.shadowDelete(shadowDraft_, ++historyRevision_, now, kShadowTimeoutUsec)) {
@@ -859,12 +1040,14 @@ void WinApp::onPassiveKey(DWORD vk, bool shift, bool ctrl, bool alt, char asciiC
         }
         break;
     case VK_LEFT:
+        selectionLikely_ = false;
         appAscii_.clear();
         if (config_.historyEnabled && shadowDraft_) {
             history_.shadowMoveLeft(shadowDraft_, now, kShadowTimeoutUsec);
         }
         break;
     case VK_RIGHT:
+        selectionLikely_ = false;
         appAscii_.clear();
         if (config_.historyEnabled && shadowDraft_) {
             history_.shadowMoveRight(shadowDraft_, now, kShadowTimeoutUsec);
@@ -879,6 +1062,7 @@ void WinApp::onPassiveKey(DWORD vk, bool shift, bool ctrl, bool alt, char asciiC
     case VK_NEXT:
     case VK_TAB:
     case VK_ESCAPE:
+        selectionLikely_ = false;
         appAscii_.clear();
         shadowDraft_.reset();
         break;
@@ -1199,10 +1383,14 @@ void WinApp::commitSentenceResult(std::string committed, std::string turnJson,
                                   bool candidateMode, std::size_t eraseChars,
                                   std::string_view eraseSuffix, bool replaceSelection) {
     appAscii_.clear();
+    selectionLikely_ = false;
     if (!hasActiveSession()) {
         overlay_.hide();
     }
     HWND fg = lastFgWnd_ ? lastFgWnd_ : ::GetForegroundWindow();
+    if (fg) {
+        savedWindowAscii_.erase(fg);
+    }
     const bool allowHistory =
         config_.historyEnabled &&
         ((turnJson.empty() && !candidateMode) || sentRev >= historyClearedAt_);
@@ -1498,6 +1686,7 @@ void WinApp::resetActiveSession() {
     draftEraseChars_ = 0;
     draftEraseSuffix_.clear();
     draftReplaceSelection_ = false;
+    selectionLikely_ = false;
     queue_.clear();
     pendingCandidates_.reset();
     activeSessionAtomic_.store(false);

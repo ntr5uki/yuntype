@@ -19,6 +19,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace yuntype::win {
@@ -89,6 +90,8 @@ private:
     void onPassiveKey(DWORD vk, bool shift, bool ctrl, bool alt, char asciiCh);
     void onForegroundChanged(HWND newFg);
     void onMouseClick(POINT pt);
+    void onMouseUp(POINT pt);
+    void saveWindowAscii(HWND hwnd);
 
     void handleDraftKey(DWORD vk, bool ctrl, char asciiCh);
     void handleQueueKey(DWORD vk, char asciiCh);
@@ -145,11 +148,23 @@ private:
     std::uint64_t historyDirtySinceUsec_ = 0;
     std::uint64_t historyLastMutatedUsec_ = 0;
 
+    struct SavedWindowAscii {
+        std::string text;
+        std::uint64_t savedUsec = 0;
+    };
+
     HWND lastFgWnd_ = nullptr;
     std::optional<POINT> lastClickPt_;
     RECT activeAnchor_{};
 
     std::string appAscii_;
+    std::unordered_map<HWND, SavedWindowAscii> savedWindowAscii_;
+    bool selectionLikely_ = false;
+    POINT mouseDownPt_{};
+    bool mouseDownValid_ = false;
+    bool mouseDownInClient_ = false;
+    std::uint64_t lastClickMs_ = 0;
+    POINT prevClickPt_{};
     bool draftActive_ = false;
     std::string draft_;
     std::size_t draftCursor_ = 0;

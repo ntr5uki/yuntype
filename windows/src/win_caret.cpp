@@ -618,6 +618,34 @@ std::optional<yuntype::SurroundingSnapshot> CaretTracker::readSurrounding(HWND f
                     };
                     return;
                 }
+                // Fallback for editable controls without TextPattern (e.g. WeChat / Qt inputs):
+                // inspect writable UIA ValuePattern when reasonably short.
+                ComPtr<IUIAutomationValuePattern> vp;
+                if (SUCCEEDED(focusedElem->GetCurrentPatternAs(
+                        UIA_ValuePatternId, IID_PPV_ARGS(vp.put()))) &&
+                    vp) {
+                    BOOL isReadOnly = FALSE;
+                    if (SUCCEEDED(vp->get_CurrentIsReadOnly(&isReadOnly)) && !isReadOnly) {
+                        BSTR valBstr = nullptr;
+                        if (SUCCEEDED(vp->get_CurrentValue(&valBstr)) && valBstr) {
+                            const UINT wlen = ::SysStringLen(valBstr);
+                            std::string valUtf8;
+                            if (wlen > 0 && wlen <= 2048) {
+                                valUtf8 = wideToUtf8(std::wstring_view(valBstr, wlen));
+                            }
+                            ::SysFreeString(valBstr);
+                            if (!valUtf8.empty()) {
+                                const std::size_t endPos = valUtf8.size();
+                                *result = yuntype::SurroundingSnapshot{
+                                    std::move(valUtf8),
+                                    endPos,
+                                    endPos,
+                                };
+                                return;
+                            }
+                        }
+                    }
+                }
             }
         }
         if (HWND editHwnd = findWin32EditTarget(fgWnd)) {
