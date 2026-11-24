@@ -655,8 +655,8 @@ void WinApp::onTrigger() {
         const std::size_t eraseCount = yuntype::utf8Length(suffix);
         appAscii_.clear();
         if (config_.historyEnabled && shadowDraft_) {
-            if (history_.shadowEraseTrailing(shadowDraft_, suffix, ++historyRevision_,
-                                             monotonicNowUsec(), kShadowTimeoutUsec)) {
+            if (history_.shadowEraseSuffixBeforeCursor(shadowDraft_, suffix, ++historyRevision_,
+                                                       monotonicNowUsec(), kShadowTimeoutUsec)) {
                 onHistoryMutated();
             }
         }
