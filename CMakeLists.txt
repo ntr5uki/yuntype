@@ -45,6 +45,10 @@ if(BUILD_TESTING)
 endif()
 
 if(WIN32)
+    set(YUNTYPE_WIN_MANIFEST_SRC windows/yuntype.rc)
+    if(MSVC)
+        set(YUNTYPE_WIN_MANIFEST_SRC windows/yuntype.manifest)
+    endif()
     add_executable(yuntype WIN32
         windows/src/main.cpp
         windows/src/win_app.cpp
@@ -53,7 +57,7 @@ if(WIN32)
         windows/src/win_overlay.cpp
         windows/src/win_sender.cpp
         windows/src/win_settings_server.cpp
-        windows/yuntype.rc
+        ${YUNTYPE_WIN_MANIFEST_SRC}
     )
     target_include_directories(yuntype PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/windows/src"
