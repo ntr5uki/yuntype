@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(fcitx5-yuntype VERSION 0.1.15 LANGUAGES CXX)
+project(fcitx5-yuntype VERSION 0.1.16 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -74,6 +74,7 @@ if(WIN32)
         yuntype_core
         user32
         gdi32
+        imm32
         shell32
         advapi32
         ole32

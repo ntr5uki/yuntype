@@ -5,6 +5,7 @@
 #include "../../core/pinyin_util.h"
 #include "../../core/utf8_util.h"
 
+#include <imm.h>
 #include <shellapi.h>
 
 #include <algorithm>
@@ -37,6 +38,38 @@ constexpr UINT IDM_OPEN_SETTINGS = 3002;
 constexpr UINT IDM_CLEAR_HISTORY = 3003;
 constexpr UINT IDM_AUTO_START = 3004;
 constexpr UINT IDM_EXIT = 3005;
+
+bool isForegroundChineseImeActive() {
+    HWND fg = ::GetForegroundWindow();
+    if (!fg) {
+        return false;
+    }
+    const DWORD tid = ::GetWindowThreadProcessId(fg, nullptr);
+    GUITHREADINFO gti{};
+    gti.cbSize = sizeof(gti);
+    HWND focus = fg;
+    if (::GetGUIThreadInfo(tid, &gti) && gti.hwndFocus) {
+        focus = gti.hwndFocus;
+    }
+    HWND imeWnd = ::ImmGetDefaultIMEWnd(focus);
+    if (!imeWnd) {
+        return false;
+    }
+    constexpr WPARAM kImcGetOpenStatus = 0x0005;
+    constexpr WPARAM kImcGetConversionMode = 0x0001;
+    DWORD_PTR openStatus = 0;
+    if (!::SendMessageTimeoutW(imeWnd, WM_IME_CONTROL, kImcGetOpenStatus, 0,
+                               SMTO_ABORTIFHUNG, 15, &openStatus) ||
+        openStatus == 0) {
+        return false;
+    }
+    DWORD_PTR convMode = 0;
+    if (!::SendMessageTimeoutW(imeWnd, WM_IME_CONTROL, kImcGetConversionMode, 0,
+                               SMTO_ABORTIFHUNG, 15, &convMode)) {
+        return false;
+    }
+    return (convMode & IME_CMODE_NATIVE) != 0;
+}
 
 bool isModifierVk(DWORD vk) {
     return vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT ||
@@ -706,25 +739,13 @@ void WinApp::onTrigger() {
         }
     }
 
-    // 2. Recently typed ASCII pinyin suffix (verified against UIA surrounding when available)
+    // 2. Recently typed ASCII pinyin suffix: trust appAscii_ directly (VS Code Monaco and other
+    //    custom editors often return empty/stale UIA text, so never let UIA veto tracked ASCII!).
+    //    Chinese IME input is already excluded at capture time in onPassiveKey().
     std::string suffix = yuntype::extractReplaceablePinyinSuffix(appAscii_);
-    if (!suffix.empty() && snap) {
-        if (snap->start == snap->end && snap->start > 0) {
-            const std::string_view beforeCaret =
-                std::string_view(snap->text).substr(0, snap->start);
-            if (!beforeCaret.ends_with(suffix)) {
-                // Text before caret doesn't end with our tracked ASCII (e.g. converted by another IME)
-                suffix.clear();
-                appAscii_.clear();
-            }
-        } else if (snap->start == 0) {
-            suffix.clear();
-            appAscii_.clear();
-        }
-    }
 
-    // 3. Focus-loss / click-reposition recovery: even if appAscii_ was cleared on focus loss,
-    //    inspect ASCII pinyin immediately before the caret via UIA (skipping freshly committed English).
+    // 3. Focus-loss / click-reposition recovery: when appAscii_ is empty, inspect ASCII pinyin
+    //    immediately before the caret via UIA (skipping freshly committed English).
     if (suffix.empty() && snap && snap->start == snap->end && snap->start > 0) {
         const std::string_view beforeCaret =
             std::string_view(snap->text).substr(0, snap->start);
@@ -788,6 +809,10 @@ void WinApp::onPassiveKey(DWORD vk, bool shift, bool ctrl, bool alt, char asciiC
     }
 
     if (asciiCh >= 0x20 && asciiCh <= 0x7E) {
+        if (isForegroundChineseImeActive()) {
+            appAscii_.clear();
+            return;
+        }
         appAscii_.push_back(asciiCh);
         if (appAscii_.size() > kMaxAsciiTrackBytes) {
             appAscii_.erase(0, appAscii_.size() - kMaxAsciiTrackBytes);

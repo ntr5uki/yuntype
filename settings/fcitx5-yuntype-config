@@ -12,7 +12,7 @@ import urllib.request
 import uuid
 
 APP_ID = "org.fcitx.Fcitx5.YunType.Config"
-VERSION = "@VERSION@" if not "@VERSION@".startswith("@") else "0.1.15"
+VERSION = "@VERSION@" if not "@VERSION@".startswith("@") else "0.1.16"
 
 XDG_CONFIG = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
 XDG_DATA = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
