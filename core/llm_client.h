@@ -61,9 +61,18 @@ struct Snapshot {
     bool candidateMode = false;
 };
 
+struct FetchModelsResult {
+    bool ok = false;
+    std::vector<std::string> models;
+    std::string error;
+};
+
 // JSON helpers exposed for unit tests
 std::string jsonEscape(std::string_view s);
 std::string jsonQuote(std::string_view s);
+std::string modelsEndpoint(std::string_view baseUrl);
+std::vector<std::string> parseModelIdsJson(std::string_view body);
+FetchModelsResult fetchAvailableModels(const LlmConfig &config);
 std::pair<std::string, std::string> parseTurnPair(std::string_view line);
 std::string extractSseDelta(std::string_view line);
 std::string extractJsonError(std::string_view body);

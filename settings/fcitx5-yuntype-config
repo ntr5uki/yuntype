@@ -12,7 +12,7 @@ import urllib.request
 import uuid
 
 APP_ID = "org.fcitx.Fcitx5.YunType.Config"
-VERSION = "@VERSION@" if not "@VERSION@".startswith("@") else "0.1.13"
+VERSION = "@VERSION@" if not "@VERSION@".startswith("@") else "0.1.14"
 
 XDG_CONFIG = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
 XDG_DATA = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
@@ -585,13 +585,31 @@ def strip_think(text):
     return text.strip()
 
 
-def fetch_models(base_url, key):
-    data = request_json(models_endpoint(base_url), key, timeout=10)
-    items = data.get("data") if isinstance(data, dict) else None
+def parse_model_ids(data):
+    items = None
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        if isinstance(data.get("data"), list):
+            items = data["data"]
+        elif isinstance(data.get("models"), list):
+            items = data["models"]
     if not isinstance(items, list):
         return []
-    ids = [str(item.get("id", "")).strip() for item in items if isinstance(item, dict) and item.get("id")]
+    ids = []
+    for item in items:
+        if isinstance(item, str) and item.strip():
+            ids.append(item.strip())
+        elif isinstance(item, dict):
+            val = item.get("id") or item.get("name")
+            if isinstance(val, str) and val.strip():
+                ids.append(val.strip())
     return sorted(set(ids), key=lambda s: (s.lower(), s))
+
+
+def fetch_models(base_url, key):
+    data = request_json(models_endpoint(base_url), key, timeout=10)
+    return parse_model_ids(data)
 
 
 def test_sentence_conversion(
@@ -768,6 +786,8 @@ def run_self_test():
         threading.Thread(target=server.serve_forever, daemon=True).start()
         base = f"http://127.0.0.1:{server.server_address[1]}/v1"
         assert fetch_models(base, "sk-ok") == ["deepseek-chat", "deepseek-reasoner"]
+        assert parse_model_ids({"models": [{"name": "qwen3"}, {"id": "ds4"}]}) == ["ds4", "qwen3"]
+        assert parse_model_ids(["zeta", "alpha", "alpha"]) == ["alpha", "zeta"]
         text, _sec = test_sentence_conversion(base, "sk-ok", "deepseek-chat")
         assert text.startswith("你明天有时间吗？") and "|default）" in text, text
         text2, _sec2 = test_sentence_conversion(
@@ -1231,11 +1251,10 @@ class SettingsWindow(Adw.ApplicationWindow):
 
         self.model_row = Adw.EntryRow(title="模型名称")
         self.model_btn = Gtk.MenuButton(
-            icon_name="view-list-symbolic",
+            label="获取模型",
             valign=Gtk.Align.CENTER,
-            tooltip_text="从接口获取模型列表",
+            tooltip_text="从接口获取可用模型 ID 列表",
         )
-        self.model_btn.add_css_class("flat")
         self.model_btn.set_popover(self.build_model_popover())
         self.model_row.add_suffix(self.model_btn)
         self.editor_group.add(self.model_row)
@@ -1583,9 +1602,18 @@ class SettingsWindow(Adw.ApplicationWindow):
             margin_start=6,
             margin_end=6,
         )
-        self.model_search = Gtk.SearchEntry(placeholder_text="搜索模型")
+        search_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.model_search = Gtk.SearchEntry(placeholder_text="搜索模型 ID", hexpand=True)
         self.model_search.connect("search-changed", lambda _e: self.model_list.invalidate_filter())
-        box.append(self.model_search)
+        search_bar.append(self.model_search)
+        refresh_btn = Gtk.Button(
+            icon_name="view-refresh-symbolic",
+            tooltip_text="重新拉取模型列表",
+        )
+        refresh_btn.add_css_class("flat")
+        refresh_btn.connect("clicked", lambda _b: self.load_models(force=True))
+        search_bar.append(refresh_btn)
+        box.append(search_bar)
         self.model_status = Gtk.Label(wrap=True, max_width_chars=36, xalign=0)
         self.model_status.add_css_class("dim-label")
         box.append(self.model_status)
@@ -1608,7 +1636,7 @@ class SettingsWindow(Adw.ApplicationWindow):
         q = self.model_search.get_text().strip().lower()
         return not q or q in row.model_id.lower()
 
-    def load_models(self):
+    def load_models(self, force=False):
         base = self.url_row.get_text().strip()
         key = self.key_row.get_text().strip()
         self.model_search.set_text("")
@@ -1616,7 +1644,7 @@ class SettingsWindow(Adw.ApplicationWindow):
             self.fill_models(None, "请先填写接口地址")
             return
         token = (base, key)
-        if self.models_cache is not None and self.models_for == token:
+        if not force and self.models_cache is not None and self.models_for == token:
             self.fill_models(self.models_cache, None)
             return
         self.fill_models([], "正在获取模型列表…")
@@ -1640,8 +1668,12 @@ class SettingsWindow(Adw.ApplicationWindow):
             self.fill_models(None, f"获取失败：{error}")
         elif not models:
             self.fill_models([], "接口未返回模型列表，请直接输入模型名")
+        elif len(models) == 1:
+            self.model_row.set_text(models[0])
+            self.fill_models(models, f"已自动填入唯一模型：{models[0]}")
+            self.model_btn.popdown()
         else:
-            self.fill_models(models, None)
+            self.fill_models(models, f"共 {len(models)} 个模型，支持关键词搜索")
         return GLib.SOURCE_REMOVE
 
     def fill_models(self, models, status):

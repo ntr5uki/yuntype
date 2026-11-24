@@ -86,6 +86,32 @@ int main() {
         CHECK(cands[0] == "翻页");
     }
 
+    // 5. Models endpoint normalization & JSON model ID parsing
+    {
+        CHECK(modelsEndpoint("https://api.deepseek.com/v1") == "https://api.deepseek.com/v1/models");
+        CHECK(modelsEndpoint("https://api.deepseek.com/v1/") == "https://api.deepseek.com/v1/models");
+        CHECK(modelsEndpoint("https://api.deepseek.com/v1/chat/completions") ==
+              "https://api.deepseek.com/v1/models");
+        CHECK(modelsEndpoint("https://api.deepseek.com/v1/models") ==
+              "https://api.deepseek.com/v1/models");
+
+        const auto m1 = parseModelIdsJson(
+            R"({"object":"list","data":[{"id":"Qwen-Flash","owned_by":"x"},{"id":"deepseek-chat"},{"id":"deepseek-chat"}]})");
+        CHECK(m1.size() == 2);
+        CHECK(m1[0] == "deepseek-chat");
+        CHECK(m1[1] == "Qwen-Flash");
+
+        const auto m2 = parseModelIdsJson(R"({"models":[{"name":"llama3"},{"id":"ds4"}]})");
+        CHECK(m2.size() == 2);
+        CHECK(m2[0] == "ds4");
+        CHECK(m2[1] == "llama3");
+
+        const auto m3 = parseModelIdsJson(R"(["zeta","alpha","alpha"])");
+        CHECK(m3.size() == 2);
+        CHECK(m3[0] == "alpha");
+        CHECK(m3[1] == "zeta");
+    }
+
     std::cout << "test_core ok\n";
     return 0;
 }

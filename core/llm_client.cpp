@@ -1488,4 +1488,365 @@ void LlmClient::cancelCompaction() {
     compaction_->snap = Snapshot{};
 }
 
+std::string modelsEndpoint(std::string_view baseUrl) {
+    std::string base = trim(baseUrl);
+    while (!base.empty() && base.back() == '/') {
+        base.pop_back();
+    }
+    if (base.empty()) {
+        return {};
+    }
+    constexpr std::string_view kChatSuffix = "/chat/completions";
+    if (base.ends_with(kChatSuffix)) {
+        base.erase(base.size() - kChatSuffix.size());
+        while (!base.empty() && base.back() == '/') {
+            base.pop_back();
+        }
+    }
+    if (base.ends_with("/models")) {
+        return base;
+    }
+    return base + "/models";
+}
+
+std::vector<std::string> parseModelIdsJson(std::string_view body) {
+    auto parseArray = [](std::string_view sv, std::size_t &pos, std::vector<std::string> &out) {
+        skipJsonWs(sv, pos);
+        if (pos >= sv.size() || sv[pos] != '[') {
+            return;
+        }
+        ++pos;
+        skipJsonWs(sv, pos);
+        if (pos < sv.size() && sv[pos] == ']') {
+            ++pos;
+            return;
+        }
+        while (pos < sv.size()) {
+            skipJsonWs(sv, pos);
+            if (pos >= sv.size()) {
+                return;
+            }
+            if (sv[pos] == '"') {
+                std::string s;
+                if (!parseJsonStringStrict(sv, pos, s)) {
+                    return;
+                }
+                s = trim(s);
+                if (!s.empty()) {
+                    out.push_back(std::move(s));
+                }
+            } else if (sv[pos] == '{') {
+                ++pos;
+                std::string idVal;
+                std::string nameVal;
+                skipJsonWs(sv, pos);
+                if (pos < sv.size() && sv[pos] == '}') {
+                    ++pos;
+                } else {
+                    while (pos < sv.size()) {
+                        skipJsonWs(sv, pos);
+                        std::string key;
+                        if (!parseJsonStringStrict(sv, pos, key)) {
+                            return;
+                        }
+                        skipJsonWs(sv, pos);
+                        if (pos >= sv.size() || sv[pos] != ':') {
+                            return;
+                        }
+                        ++pos;
+                        skipJsonWs(sv, pos);
+                        if ((key == "id" || key == "name") && pos < sv.size() && sv[pos] == '"') {
+                            std::string val;
+                            if (!parseJsonStringStrict(sv, pos, val)) {
+                                return;
+                            }
+                            if (key == "id") {
+                                idVal = trim(val);
+                            } else if (nameVal.empty()) {
+                                nameVal = trim(val);
+                            }
+                        } else {
+                            if (!skipJsonValueStrict(sv, pos, 1)) {
+                                return;
+                            }
+                        }
+                        skipJsonWs(sv, pos);
+                        if (pos < sv.size() && sv[pos] == '}') {
+                            ++pos;
+                            break;
+                        }
+                        if (pos >= sv.size() || sv[pos] != ',') {
+                            return;
+                        }
+                        ++pos;
+                    }
+                }
+                if (!idVal.empty()) {
+                    out.push_back(std::move(idVal));
+                } else if (!nameVal.empty()) {
+                    out.push_back(std::move(nameVal));
+                }
+            } else {
+                if (!skipJsonValueStrict(sv, pos, 1)) {
+                    return;
+                }
+            }
+            skipJsonWs(sv, pos);
+            if (pos < sv.size() && sv[pos] == ']') {
+                ++pos;
+                return;
+            }
+            if (pos >= sv.size() || sv[pos] != ',') {
+                return;
+            }
+            ++pos;
+        }
+    };
+
+    std::vector<std::string> ids;
+    std::size_t pos = 0;
+    skipJsonWs(body, pos);
+    if (pos < body.size() && body[pos] == '[') {
+        parseArray(body, pos, ids);
+    } else if (pos < body.size() && body[pos] == '{') {
+        ++pos;
+        skipJsonWs(body, pos);
+        if (pos < body.size() && body[pos] != '}') {
+            while (pos < body.size()) {
+                skipJsonWs(body, pos);
+                std::string key;
+                if (!parseJsonStringStrict(body, pos, key)) {
+                    break;
+                }
+                skipJsonWs(body, pos);
+                if (pos >= body.size() || body[pos] != ':') {
+                    break;
+                }
+                ++pos;
+                skipJsonWs(body, pos);
+                if ((key == "data" || key == "models") && pos < body.size() && body[pos] == '[') {
+                    parseArray(body, pos, ids);
+                } else {
+                    if (!skipJsonValueStrict(body, pos, 1)) {
+                        break;
+                    }
+                }
+                skipJsonWs(body, pos);
+                if (pos < body.size() && body[pos] == '}') {
+                    break;
+                }
+                if (pos >= body.size() || body[pos] != ',') {
+                    break;
+                }
+                ++pos;
+            }
+        }
+    }
+
+    auto ciLess = [](const std::string &a, const std::string &b) {
+        const std::size_t n = std::min(a.size(), b.size());
+        for (std::size_t i = 0; i < n; ++i) {
+            const unsigned char ca = static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(a[i])));
+            const unsigned char cb = static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(b[i])));
+            if (ca != cb) {
+                return ca < cb;
+            }
+        }
+        if (a.size() != b.size()) {
+            return a.size() < b.size();
+        }
+        return a < b;
+    };
+    std::sort(ids.begin(), ids.end(), ciLess);
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    return ids;
+}
+
+FetchModelsResult fetchAvailableModels(const LlmConfig &config) {
+    FetchModelsResult res;
+    const std::string url = modelsEndpoint(config.baseUrl);
+    if (url.empty()) {
+        res.error = "请先填写接口地址";
+        return res;
+    }
+    const std::string key = resolveApiKey(config);
+    int httpCode = 0;
+    std::string responseBody;
+
+#ifdef _WIN32
+    const std::wstring urlW = utf8ToWide(url);
+    URL_COMPONENTS parts{};
+    parts.dwStructSize = sizeof(parts);
+    parts.dwSchemeLength = static_cast<DWORD>(-1);
+    parts.dwHostNameLength = static_cast<DWORD>(-1);
+    parts.dwUrlPathLength = static_cast<DWORD>(-1);
+    parts.dwExtraInfoLength = static_cast<DWORD>(-1);
+    if (!::WinHttpCrackUrl(urlW.c_str(), static_cast<DWORD>(urlW.size()), 0, &parts) ||
+        parts.dwHostNameLength == 0) {
+        res.error = "无法解析接口地址";
+        return res;
+    }
+    const std::wstring hostW(parts.lpszHostName, parts.dwHostNameLength);
+    std::wstring pathW = parts.dwUrlPathLength > 0
+                             ? std::wstring(parts.lpszUrlPath, parts.dwUrlPathLength)
+                             : L"/";
+    if (parts.dwExtraInfoLength > 0) {
+        pathW.append(parts.lpszExtraInfo, parts.dwExtraInfoLength);
+    }
+    const bool isHttps = (parts.nScheme == INTERNET_SCHEME_HTTPS);
+    const DWORD accessType = config.isLoopback()
+        ? WINHTTP_ACCESS_TYPE_NO_PROXY
+        : WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY;
+    HINTERNET hSession = ::WinHttpOpen(
+        L"YunType/1.0", accessType, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession && !config.isLoopback()) {
+        hSession = ::WinHttpOpen(
+            L"YunType/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    }
+    if (!hSession) {
+        res.error = "初始化 WinHTTP 失败";
+        return res;
+    }
+    ::WinHttpSetTimeouts(hSession, 8000, 8000, 10000, 15000);
+    HINTERNET hConnect = ::WinHttpConnect(hSession, hostW.c_str(), parts.nPort, 0);
+    if (!hConnect) {
+        ::WinHttpCloseHandle(hSession);
+        res.error = "连接模型服务失败";
+        return res;
+    }
+    HINTERNET hRequest = ::WinHttpOpenRequest(
+        hConnect, L"GET", pathW.c_str(), nullptr,
+        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, isHttps ? WINHTTP_FLAG_SECURE : 0);
+    if (!hRequest) {
+        ::WinHttpCloseHandle(hConnect);
+        ::WinHttpCloseHandle(hSession);
+        res.error = "创建 HTTP 请求失败";
+        return res;
+    }
+    std::wstring headers = L"Accept: application/json\r\n";
+    if (!key.empty()) {
+        headers += L"Authorization: Bearer " + utf8ToWide(key) + L"\r\n";
+    }
+    const BOOL sent = ::WinHttpSendRequest(
+        hRequest, headers.c_str(), static_cast<DWORD>(headers.size()),
+        WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+    if (!sent || !::WinHttpReceiveResponse(hRequest, nullptr)) {
+        const DWORD err = ::GetLastError();
+        ::WinHttpCloseHandle(hRequest);
+        ::WinHttpCloseHandle(hConnect);
+        ::WinHttpCloseHandle(hSession);
+        res.error = (err == ERROR_WINHTTP_TIMEOUT) ? "获取模型列表超时" : "连接模型服务失败";
+        return res;
+    }
+    DWORD statusCode = 0;
+    DWORD statusSize = sizeof(statusCode);
+    ::WinHttpQueryHeaders(
+        hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+    httpCode = static_cast<int>(statusCode);
+    char buf[4096];
+    while (responseBody.size() < (4U << 20)) {
+        DWORD bytesRead = 0;
+        if (!::WinHttpReadData(hRequest, buf, sizeof(buf), &bytesRead) || bytesRead == 0) {
+            break;
+        }
+        responseBody.append(buf, static_cast<std::size_t>(bytesRead));
+    }
+    ::WinHttpCloseHandle(hRequest);
+    ::WinHttpCloseHandle(hConnect);
+    ::WinHttpCloseHandle(hSession);
+#else
+    std::string curlCfg;
+    curlCfg += "url = " + curlQuote(url) + "\n";
+    curlCfg += "request = \"GET\"\n";
+    curlCfg += "header = \"Accept: application/json\"\n";
+    if (!key.empty()) {
+        curlCfg += "header = " + curlQuote("Authorization: Bearer " + key) + "\n";
+    }
+    if (config.isLoopback()) {
+        curlCfg += "noproxy = \"*\"\n";
+    }
+    int inPipe[2];
+    int outPipe[2];
+    if (::pipe(inPipe) != 0) {
+        res.error = "创建管道失败";
+        return res;
+    }
+    if (::pipe(outPipe) != 0) {
+        ::close(inPipe[0]);
+        ::close(inPipe[1]);
+        res.error = "创建管道失败";
+        return res;
+    }
+    pid_t pid = ::fork();
+    if (pid < 0) {
+        ::close(inPipe[0]);
+        ::close(inPipe[1]);
+        ::close(outPipe[0]);
+        ::close(outPipe[1]);
+        res.error = "启动 curl 进程失败";
+        return res;
+    }
+    if (pid == 0) {
+        ::dup2(inPipe[0], STDIN_FILENO);
+        ::dup2(outPipe[1], STDOUT_FILENO);
+        ::dup2(outPipe[1], STDERR_FILENO);
+        ::close(inPipe[0]);
+        ::close(inPipe[1]);
+        ::close(outPipe[0]);
+        ::close(outPipe[1]);
+        const char *argv[] = {
+            "curl", "-sS",
+            "--connect-timeout", "8",
+            "--max-time", "15",
+            "-w", "\n<<<FCITX5-YUNTYPE-HTTP %{http_code}>>>\n",
+            "-K", "-",
+            nullptr
+        };
+        ::execvp("curl", const_cast<char *const *>(argv));
+        _exit(127);
+    }
+    ::close(inPipe[0]);
+    ::close(outPipe[1]);
+    const char *ptr = curlCfg.data();
+    std::size_t rem = curlCfg.size();
+    while (rem > 0) {
+        const ssize_t n = ::write(inPipe[1], ptr, rem);
+        if (n <= 0) break;
+        ptr += n;
+        rem -= static_cast<std::size_t>(n);
+    }
+    ::close(inPipe[1]);
+    std::string rawOut;
+    char buf[4096];
+    ssize_t n = 0;
+    while ((n = ::read(outPipe[0], buf, sizeof(buf))) > 0 && rawOut.size() < (4U << 20)) {
+        rawOut.append(buf, static_cast<std::size_t>(n));
+    }
+    ::close(outPipe[0]);
+    int status = 0;
+    ::waitpid(pid, &status, 0);
+    if (auto mark = rawOut.rfind(kHttpMark); mark != std::string::npos) {
+        httpCode = std::atoi(rawOut.c_str() + mark + std::strlen(kHttpMark));
+        responseBody = rawOut.substr(0, mark);
+    } else {
+        responseBody = std::move(rawOut);
+    }
+#endif
+
+    if (httpCode >= 400 || httpCode == 0) {
+        std::string err = extractJsonError(responseBody);
+        if (err.empty()) {
+            err = httpCode > 0 ? ("HTTP " + std::to_string(httpCode)) : "连接模型服务失败";
+        }
+        res.error = redactKey(std::move(err), key);
+        return res;
+    }
+
+    res.models = parseModelIdsJson(responseBody);
+    res.ok = true;
+    return res;
+}
+
 } // namespace yuntype

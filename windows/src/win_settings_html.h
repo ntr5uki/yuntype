@@ -77,6 +77,24 @@ inline constexpr const char *kSettingsPageHtml = R"YUNTYPE_HTML(<!doctype html>
   .toast.err { border-color: var(--danger); color: var(--danger); }
   .switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
   .switch input { width: 16px; height: 16px; accent-color: var(--accent); }
+  .model-field { position: relative; }
+  .model-input-row { display: flex; gap: 8px; align-items: center; }
+  .model-input-row input { flex: 1; }
+  .model-picker {
+    position: absolute; left: 0; right: 0; top: calc(100% + 6px); z-index: 50;
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    box-shadow: 0 12px 28px rgba(0,0,0,.22); padding: 8px; display: none;
+  }
+  .model-picker.open { display: block; }
+  .picker-search { margin-bottom: 6px; }
+  .picker-list { max-height: 240px; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
+  .picker-item {
+    text-align: left; width: 100%; border: 0; background: transparent; color: var(--fg);
+    padding: 6px 8px; border-radius: 6px; cursor: pointer; font: inherit;
+    font-family: Consolas, monospace; font-size: 13px;
+  }
+  .picker-item:hover, .picker-item.selected { background: var(--accent); color: var(--accent-fg); }
+  .picker-empty { color: var(--muted); font-size: 12.5px; padding: 8px; }
 </style>
 </head>
 <body>
@@ -102,8 +120,20 @@ inline constexpr const char *kSettingsPageHtml = R"YUNTYPE_HTML(<!doctype html>
     <div class="editor" id="modelEditor">
       <div class="row"><label>配置名称</label><input type="text" id="mName" placeholder="例如：DeepSeek"></div>
       <div class="row"><label>接口地址 Base URL</label><input type="text" id="mBaseUrl" placeholder="https://api.deepseek.com/v1"></div>
-      <div class="row"><label>模型名称</label><input type="text" id="mModel" placeholder="deepseek-chat"></div>
       <div class="row"><label>API Key</label><input type="password" id="mApiKey" placeholder="sk-..."></div>
+      <div class="row">
+        <label>模型名称</label>
+        <div class="model-field" id="modelField">
+          <div class="model-input-row">
+            <input type="text" id="mModel" placeholder="deepseek-chat">
+            <button type="button" class="btn sm" id="btnFetchModels">获取模型</button>
+          </div>
+          <div class="model-picker" id="modelPicker">
+            <input type="text" class="picker-search" id="pickerSearch" placeholder="输入关键词筛选模型 ID…">
+            <div class="picker-list" id="pickerList"></div>
+          </div>
+        </div>
+      </div>
       <div class="row">
         <label>思考模式</label>
         <select id="mThinking">
@@ -306,6 +336,84 @@ function collectState() {
   state.sentence_prompt = document.getElementById('sentencePrompt').value;
   return state;
 }
+
+let fetchedModels = [];
+
+function closeModelPicker() {
+  document.getElementById('modelPicker').classList.remove('open');
+}
+
+function renderPickerList() {
+  const list = document.getElementById('pickerList');
+  const q = document.getElementById('pickerSearch').value.trim().toLowerCase();
+  const current = document.getElementById('mModel').value.trim();
+  const matched = fetchedModels.filter(id => !q || id.toLowerCase().includes(q));
+  list.innerHTML = '';
+  if (!matched.length) {
+    const empty = document.createElement('div');
+    empty.className = 'picker-empty';
+    empty.textContent = fetchedModels.length ? '无匹配的模型 ID' : '接口未返回模型列表，请手动输入';
+    list.appendChild(empty);
+    return;
+  }
+  matched.forEach(id => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'picker-item' + (id === current ? ' selected' : '');
+    btn.textContent = id;
+    btn.onclick = () => {
+      document.getElementById('mModel').value = id;
+      closeModelPicker();
+    };
+    list.appendChild(btn);
+  });
+}
+
+document.getElementById('pickerSearch').oninput = renderPickerList;
+document.getElementById('pickerSearch').onkeydown = (e) => {
+  if (e.key === 'Escape') closeModelPicker();
+};
+document.addEventListener('click', (e) => {
+  if (!document.getElementById('modelField').contains(e.target)) {
+    closeModelPicker();
+  }
+});
+document.getElementById('btnFetchModels').onclick = async () => {
+  const base_url = document.getElementById('mBaseUrl').value.trim();
+  const api_key = document.getElementById('mApiKey').value.trim();
+  if (!base_url) {
+    toast('请先填写接口地址 Base URL', 'err');
+    return;
+  }
+  const btn = document.getElementById('btnFetchModels');
+  btn.disabled = true;
+  btn.textContent = '获取中…';
+  try {
+    const res = await api('/api/models', 'POST', { name: 'probe', base_url, api_key });
+    fetchedModels = Array.isArray(res.models) ? res.models : [];
+    if (fetchedModels.length === 1) {
+      document.getElementById('mModel').value = fetchedModels[0];
+      closeModelPicker();
+      toast('已自动填入唯一模型：' + fetchedModels[0]);
+    } else if (fetchedModels.length > 1) {
+      const search = document.getElementById('pickerSearch');
+      search.value = '';
+      search.placeholder = '输入关键词筛选模型 ID（共 ' + fetchedModels.length + ' 个）…';
+      renderPickerList();
+      document.getElementById('modelPicker').classList.add('open');
+      search.focus();
+    } else {
+      closeModelPicker();
+      toast('接口未返回模型列表，请手动输入模型 ID', 'err');
+    }
+  } catch (e) {
+    closeModelPicker();
+    toast('获取模型失败：' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '获取模型';
+  }
+};
 
 document.getElementById('mThinking').onchange = updateExtraVisibility;
 document.getElementById('btnApplyModel').onclick = () => {

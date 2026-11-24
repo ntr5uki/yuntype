@@ -104,6 +104,33 @@ std::string runModelTestJson(std::string_view profileJson) {
     }
 }
 
+std::string runFetchModelsJson(std::string_view reqJson) {
+    AppConfig tmp;
+    std::string wrapped = "{\"active\":\"\",\"profiles\":[" + std::string(reqJson) + "]}";
+    if (!deserializeModelsJson(wrapped, tmp) || tmp.models.empty()) {
+        return "{\"error\":\"参数格式无效\"}";
+    }
+    const auto &p = tmp.models.front();
+    yuntype::LlmConfig cfg;
+    cfg.baseUrl = p.baseUrl;
+    cfg.apiKey = p.apiKey;
+    const auto fetched = yuntype::fetchAvailableModels(cfg);
+    if (!fetched.ok) {
+        return "{\"error\":" +
+               yuntype::jsonQuote(fetched.error.empty() ? "获取模型列表失败" : fetched.error) +
+               "}";
+    }
+    std::string out = "{\"models\":[";
+    for (std::size_t i = 0; i < fetched.models.size(); ++i) {
+        if (i > 0) {
+            out.push_back(',');
+        }
+        out += yuntype::jsonQuote(fetched.models[i]);
+    }
+    out += "]}";
+    return out;
+}
+
 void launchBrowserWindow(const std::wstring &url) {
     // Prefer Edge --app mode for a clean native-like settings window; fallback to default browser.
     const std::wstring edgeArgs = L"--app=" + url + L" --window-size=860,820";
@@ -297,6 +324,11 @@ void SettingsServer::handleClient(std::uintptr_t sockVal) {
         }
     } else if (method == "POST" && path == "/api/test") {
         const std::string res = runModelTestJson(body);
+        const bool isErr = (res.find("\"error\"") != std::string::npos);
+        sendHttpResponse(s, isErr ? 400 : 200, isErr ? "Bad Request" : "OK",
+                         "application/json; charset=utf-8", res);
+    } else if (method == "POST" && path == "/api/models") {
+        const std::string res = runFetchModelsJson(body);
         const bool isErr = (res.find("\"error\"") != std::string::npos);
         sendHttpResponse(s, isErr ? 400 : 200, isErr ? "Bad Request" : "OK",
                          "application/json; charset=utf-8", res);
