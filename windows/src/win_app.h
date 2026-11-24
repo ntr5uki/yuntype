@@ -28,6 +28,7 @@ struct SubmittedSentence {
     std::string fallback;
     std::size_t pendingEraseChars = 0;
     std::string pendingEraseSuffix;
+    bool replaceSelection = false;
     bool started = false;
     std::optional<std::string> ready;
     std::optional<std::string> error;
@@ -38,6 +39,7 @@ struct PendingCandidates {
     std::string fallback;
     std::size_t pendingEraseChars = 0;
     std::string pendingEraseSuffix;
+    bool replaceSelection = false;
     std::vector<std::string> candidates;
     std::uint64_t sentRev = 0;
     int globalCursor = 0;
@@ -93,13 +95,13 @@ private:
     void handleCandidateKey(DWORD vk, bool shift, bool ctrl, char asciiCh);
 
     void submitSentence(std::string query, std::size_t pendingEraseChars,
-                        std::string pendingEraseSuffix);
+                        std::string pendingEraseSuffix, bool replaceSelection = false);
     void startLoadMoreCandidates();
     void commitPendingCandidate(int globalIndex);
     void commitSentenceResult(std::string committed, std::string turnJson,
                               std::uint64_t sentRev, std::string_view llmOriginal,
                               bool candidateMode, std::size_t eraseChars,
-                              std::string_view eraseSuffix);
+                              std::string_view eraseSuffix, bool replaceSelection = false);
 
     yuntype::SentenceContext buildHistoryContext(bool candidateMode);
     void pollTimers();
@@ -125,7 +127,7 @@ private:
 
     std::atomic<bool> enabledAtomic_{true};
     std::atomic<bool> activeSessionAtomic_{false};
-    bool triggerKeyHeld_ = false;
+    std::atomic<std::uint64_t> lastTriggerTickMs_{0};
 
     CaretTracker caret_;
     CandidateOverlay overlay_;
@@ -153,9 +155,11 @@ private:
     std::size_t draftCursor_ = 0;
     std::size_t draftEraseChars_ = 0;
     std::string draftEraseSuffix_;
+    bool draftReplaceSelection_ = false;
     std::deque<SubmittedSentence> queue_;
     std::optional<PendingCandidates> pendingCandidates_;
     std::uint64_t lastCommitUsec_ = 0;
+    std::string lastCommittedText_;
 };
 
 } // namespace yuntype::win

@@ -1,16 +1,26 @@
 #include "win_caret.h"
 #include "win_utf8.h"
 
+#include "../../core/utf8_util.h"
+
 #include <oleacc.h>
 #include <uiautomation.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 namespace yuntype::win {
 
 namespace {
+
+constexpr auto kUiaTaskTimeout = std::chrono::milliseconds(120);
 
 template <typename T>
 class ComPtr {
@@ -74,7 +84,6 @@ bool rectFromSafeArray(SAFEARRAY *sa, RECT &out, bool useRightEdge) {
     if (FAILED(::SafeArrayAccessData(sa, reinterpret_cast<void **>(&data))) || !data) {
         return false;
     }
-    // Use the last bounding rect in the range (where the caret sits)
     const LONG base = ((count / 4) - 1) * 4;
     const double left = data[base + 0];
     const double top = data[base + 1];
@@ -118,6 +127,28 @@ bool getCaretRangeFromElement(IUIAutomationElement *elem, ComPtr<IUIAutomationTe
     return false;
 }
 
+bool getSelectionRangeFromElement(IUIAutomationElement *elem,
+                                  ComPtr<IUIAutomationTextRange> &outRange) {
+    if (!elem) {
+        return false;
+    }
+    // Prefer active TextPattern::GetSelection first so non-empty selections (e.g. Ctrl+A)
+    // are returned intact instead of a collapsed caret range.
+    ComPtr<IUIAutomationTextPattern> tp;
+    if (SUCCEEDED(elem->GetCurrentPatternAs(UIA_TextPatternId, IID_PPV_ARGS(tp.put()))) && tp) {
+        ComPtr<IUIAutomationTextRangeArray> sel;
+        if (SUCCEEDED(tp->GetSelection(sel.put())) && sel) {
+            int len = 0;
+            if (SUCCEEDED(sel->get_Length(&len)) && len > 0) {
+                if (SUCCEEDED(sel->GetElement(0, outRange.put())) && outRange) {
+                    return true;
+                }
+            }
+        }
+    }
+    return getCaretRangeFromElement(elem, outRange);
+}
+
 bool getRectFromTextRange(IUIAutomationTextRange *range, RECT &out) {
     if (!range) {
         return false;
@@ -130,7 +161,6 @@ bool getRectFromTextRange(IUIAutomationTextRange *range, RECT &out) {
             return true;
         }
     }
-    // Collapsed caret at end of text often has empty bounding rect: inspect preceding char
     ComPtr<IUIAutomationTextRange> probe;
     if (SUCCEEDED(range->Clone(probe.put())) && probe) {
         int moved = 0;
@@ -147,7 +177,6 @@ bool getRectFromTextRange(IUIAutomationTextRange *range, RECT &out) {
             }
         }
     }
-    // Try expanding to enclosing character (e.g. start of empty/non-empty line)
     ComPtr<IUIAutomationTextRange> probe2;
     if (SUCCEEDED(range->Clone(probe2.put())) && probe2) {
         if (SUCCEEDED(probe2->ExpandToEnclosingUnit(TextUnit_Character))) {
@@ -217,31 +246,50 @@ bool queryGuiThreadCaret(HWND fgWnd, RECT &out, HWND *outFocusHwnd) {
     return isSaneRect(out);
 }
 
-std::optional<yuntype::SurroundingSnapshot> readWin32EditSurrounding(HWND focusHwnd) {
-    if (!focusHwnd) {
-        return std::nullopt;
+bool isClassicWin32Edit(HWND hwnd) {
+    if (!hwnd) {
+        return false;
     }
     wchar_t cls[64]{};
-    ::GetClassNameW(focusHwnd, cls, static_cast<int>(std::size(cls)));
+    ::GetClassNameW(hwnd, cls, static_cast<int>(std::size(cls)));
     const std::wstring_view clsView(cls);
-    const bool isEdit = (clsView == L"Edit" || clsView.find(L"RichEdit") != std::wstring_view::npos ||
-                         clsView.find(L"RICHEDIT") != std::wstring_view::npos);
-    if (!isEdit) {
+    return clsView == L"Edit" || clsView.find(L"RichEdit") != std::wstring_view::npos ||
+           clsView.find(L"RICHEDIT") != std::wstring_view::npos;
+}
+
+HWND findWin32EditTarget(HWND fgWnd) {
+    if (!fgWnd) {
+        return nullptr;
+    }
+    const DWORD tid = ::GetWindowThreadProcessId(fgWnd, nullptr);
+    GUITHREADINFO gti{};
+    gti.cbSize = sizeof(gti);
+    if (::GetGUIThreadInfo(tid, &gti) && gti.hwndFocus && isClassicWin32Edit(gti.hwndFocus)) {
+        return gti.hwndFocus;
+    }
+    if (isClassicWin32Edit(fgWnd)) {
+        return fgWnd;
+    }
+    return nullptr;
+}
+
+std::optional<yuntype::SurroundingSnapshot> readWin32EditSurrounding(HWND editHwnd) {
+    if (!editHwnd) {
         return std::nullopt;
     }
     DWORD_PTR lenRes = 0;
-    if (!::SendMessageTimeoutW(focusHwnd, WM_GETTEXTLENGTH, 0, 0,
+    if (!::SendMessageTimeoutW(editHwnd, WM_GETTEXTLENGTH, 0, 0,
                                SMTO_ABORTIFHUNG, 50, &lenRes)) {
         return std::nullopt;
     }
     const std::size_t len = static_cast<std::size_t>(lenRes);
-    if (len > 16384) {
+    if (len > 32768) {
         return std::nullopt;
     }
     DWORD selStart = 0;
     DWORD selEnd = 0;
     DWORD_PTR selRes = 0;
-    if (!::SendMessageTimeoutW(focusHwnd, EM_GETSEL,
+    if (!::SendMessageTimeoutW(editHwnd, EM_GETSEL,
                                reinterpret_cast<WPARAM>(&selStart),
                                reinterpret_cast<LPARAM>(&selEnd),
                                SMTO_ABORTIFHUNG, 50, &selRes)) {
@@ -250,7 +298,7 @@ std::optional<yuntype::SurroundingSnapshot> readWin32EditSurrounding(HWND focusH
     std::wstring buf(len + 1, L'\0');
     DWORD_PTR copied = 0;
     if (len > 0) {
-        if (!::SendMessageTimeoutW(focusHwnd, WM_GETTEXT,
+        if (!::SendMessageTimeoutW(editHwnd, WM_GETTEXT,
                                    static_cast<WPARAM>(buf.size()),
                                    reinterpret_cast<LPARAM>(buf.data()),
                                    SMTO_ABORTIFHUNG, 50, &copied)) {
@@ -262,12 +310,14 @@ std::optional<yuntype::SurroundingSnapshot> readWin32EditSurrounding(HWND focusH
     }
     const std::size_t s = std::min<std::size_t>(selStart, buf.size());
     const std::size_t e = std::min<std::size_t>(std::max<std::size_t>(selEnd, s), buf.size());
-    const std::size_t winStart = s > 64 ? s - 64 : 0;
-    const std::size_t winEnd = std::min<std::size_t>(buf.size(), e + 32);
+    const std::size_t winStart = s > 96 ? s - 96 : 0;
+    const std::size_t selCapEnd = std::min<std::size_t>(e, s + 2048);
+    const std::size_t winEnd = std::min<std::size_t>(buf.size(), selCapEnd + 32);
 
     const std::string leftUtf8 = wideToUtf8(std::wstring_view(buf).substr(winStart, s - winStart));
-    const std::string selUtf8 = wideToUtf8(std::wstring_view(buf).substr(s, e - s));
-    const std::string rightUtf8 = wideToUtf8(std::wstring_view(buf).substr(e, winEnd - e));
+    const std::string selUtf8 = wideToUtf8(std::wstring_view(buf).substr(s, selCapEnd - s));
+    const std::string rightUtf8 =
+        wideToUtf8(std::wstring_view(buf).substr(selCapEnd, winEnd - selCapEnd));
     return yuntype::SurroundingSnapshot{
         leftUtf8 + selUtf8 + rightUtf8,
         leftUtf8.size(),
@@ -275,89 +325,72 @@ std::optional<yuntype::SurroundingSnapshot> readWin32EditSurrounding(HWND focusH
     };
 }
 
-} // namespace
-
-struct CaretTracker::Impl {
-    bool comInitialized = false;
-    ComPtr<IUIAutomation> uia;
-
-    void ensureUia() {
-        if (uia) {
-            return;
-        }
-        if (!comInitialized) {
-            const HRESULT hr = ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-            if (SUCCEEDED(hr) || hr == S_FALSE) {
-                comInitialized = true;
-            }
-        }
-        ::CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER,
-                           IID_PPV_ARGS(uia.put()));
+bool selectWin32EditSuffix(HWND editHwnd, std::string_view expectedSuffix) {
+    if (!editHwnd || expectedSuffix.empty()) {
+        return false;
     }
-};
-
-CaretTracker::CaretTracker() : impl_(new Impl()) {
-    impl_->ensureUia();
+    const std::wstring expectedW = utf8ToWide(expectedSuffix);
+    if (expectedW.empty()) {
+        return false;
+    }
+    DWORD selStart = 0;
+    DWORD selEnd = 0;
+    DWORD_PTR selRes = 0;
+    if (!::SendMessageTimeoutW(editHwnd, EM_GETSEL,
+                               reinterpret_cast<WPARAM>(&selStart),
+                               reinterpret_cast<LPARAM>(&selEnd),
+                               SMTO_ABORTIFHUNG, 50, &selRes)) {
+        return false;
+    }
+    if (selStart != selEnd || selStart < expectedW.size()) {
+        return false;
+    }
+    DWORD_PTR lenRes = 0;
+    if (!::SendMessageTimeoutW(editHwnd, WM_GETTEXTLENGTH, 0, 0,
+                               SMTO_ABORTIFHUNG, 50, &lenRes)) {
+        return false;
+    }
+    const std::size_t len = static_cast<std::size_t>(lenRes);
+    if (len > 32768 || selStart > len) {
+        return false;
+    }
+    std::wstring buf(len + 1, L'\0');
+    DWORD_PTR copied = 0;
+    if (!::SendMessageTimeoutW(editHwnd, WM_GETTEXT,
+                               static_cast<WPARAM>(buf.size()),
+                               reinterpret_cast<LPARAM>(buf.data()),
+                               SMTO_ABORTIFHUNG, 50, &copied)) {
+        return false;
+    }
+    buf.resize(std::min<std::size_t>(static_cast<std::size_t>(copied), len));
+    if (selStart > buf.size()) {
+        return false;
+    }
+    const std::size_t startIdx = selStart - expectedW.size();
+    if (std::wstring_view(buf).substr(startIdx, expectedW.size()) != expectedW) {
+        return false;
+    }
+    DWORD_PTR setRes = 0;
+    return ::SendMessageTimeoutW(editHwnd, EM_SETSEL,
+                                 static_cast<WPARAM>(startIdx),
+                                 static_cast<LPARAM>(selStart),
+                                 SMTO_ABORTIFHUNG, 50, &setRes) != 0;
 }
 
-CaretTracker::~CaretTracker() {
-    if (impl_) {
-        impl_->uia.reset();
-        if (impl_->comInitialized) {
-            ::CoUninitialize();
-        }
-        delete impl_;
-        impl_ = nullptr;
-    }
-}
-
-CaretAnchor CaretTracker::queryCaret(HWND fgWnd, std::optional<POINT> lastClickPt) {
-    impl_->ensureUia();
+CaretAnchor fallbackCaretAnchor(HWND fgWnd, std::optional<POINT> lastClickPt) {
     RECT rc{};
-
-    // Level 1: UI Automation TextPattern2 / TextPattern
-    ComPtr<IUIAutomationElement> focusedElem;
-    if (impl_->uia && SUCCEEDED(impl_->uia->GetFocusedElement(focusedElem.put())) && focusedElem) {
-        ComPtr<IUIAutomationTextRange> range;
-        if (getCaretRangeFromElement(focusedElem.get(), range) &&
-            getRectFromTextRange(range.get(), rc)) {
-            return CaretAnchor{rc, true};
-        }
-    }
-
-    // Level 2 & 3: GetGUIThreadInfo (also yields focusHwnd for MSAA)
     HWND focusHwnd = fgWnd;
     if (queryGuiThreadCaret(fgWnd, rc, &focusHwnd)) {
         return CaretAnchor{rc, true};
     }
-    if (queryMsaaCaret(focusHwnd, rc)) {
-        return CaretAnchor{rc, true};
-    }
-    if (focusHwnd != fgWnd && queryMsaaCaret(fgWnd, rc)) {
-        return CaretAnchor{rc, true};
-    }
-
-    // Level 4a: Last mouse left-click position (usually right where the user clicked the text field)
-    if (lastClickPt) {
-        POINT pt = *lastClickPt;
-        if (fgWnd) {
-            RECT wr{};
-            if (::GetWindowRect(fgWnd, &wr) && ::PtInRect(&wr, pt)) {
-                return CaretAnchor{RECT{pt.x, pt.y, pt.x + 2, pt.y + 22}, false};
-            }
-        }
-    }
-
-    // Level 4b: Focused UIA control bounding rect (bottom-left)
-    if (focusedElem) {
-        RECT elemRc{};
-        if (SUCCEEDED(focusedElem->get_CurrentBoundingRectangle(&elemRc)) && isSaneRect(elemRc)) {
+    if (lastClickPt && fgWnd) {
+        RECT wr{};
+        if (::GetWindowRect(fgWnd, &wr) && ::PtInRect(&wr, *lastClickPt)) {
             return CaretAnchor{
-                RECT{elemRc.left + 8, elemRc.bottom - 24, elemRc.left + 10, elemRc.bottom}, false};
+                RECT{lastClickPt->x, lastClickPt->y, lastClickPt->x + 2, lastClickPt->y + 22},
+                false};
         }
     }
-
-    // Level 4c: Foreground window bottom-center
     if (fgWnd) {
         RECT wr{};
         if (::GetWindowRect(fgWnd, &wr) && wr.right > wr.left && wr.bottom > wr.top) {
@@ -366,83 +399,292 @@ CaretAnchor CaretTracker::queryCaret(HWND fgWnd, std::optional<POINT> lastClickP
             return CaretAnchor{RECT{cx, cy, cx + 2, cy + 22}, false};
         }
     }
-
-    // Last resort: primary monitor bottom-center
     const int sw = ::GetSystemMetrics(SM_CXSCREEN);
     const int sh = ::GetSystemMetrics(SM_CYSCREEN);
     return CaretAnchor{RECT{sw / 2 - 120, sh - 160, sw / 2 - 118, sh - 138}, false};
 }
 
-std::optional<yuntype::SurroundingSnapshot> CaretTracker::readSurrounding(HWND fgWnd) {
-    impl_->ensureUia();
+} // namespace
 
-    if (impl_->uia) {
-        ComPtr<IUIAutomationElement> focusedElem;
-        if (SUCCEEDED(impl_->uia->GetFocusedElement(focusedElem.put())) && focusedElem) {
-            ComPtr<IUIAutomationTextRange> selRange;
-            if (getCaretRangeFromElement(focusedElem.get(), selRange)) {
-                BSTR selBstr = nullptr;
-                std::string selUtf8;
-                if (SUCCEEDED(selRange->GetText(256, &selBstr)) && selBstr) {
-                    selUtf8 = wideToUtf8(std::wstring_view(selBstr, ::SysStringLen(selBstr)));
-                    ::SysFreeString(selBstr);
-                }
+struct CaretTracker::Impl {
+    struct PendingTask {
+        std::function<void(IUIAutomation *)> fn;
+        std::mutex doneMutex;
+        std::condition_variable doneCv;
+        bool done = false;
+    };
 
-                std::string leftUtf8;
-                ComPtr<IUIAutomationTextRange> leftRange;
-                if (SUCCEEDED(selRange->Clone(leftRange.put())) && leftRange) {
-                    leftRange->MoveEndpointByRange(TextPatternRangeEndpoint_End, selRange.get(),
-                                                   TextPatternRangeEndpoint_Start);
-                    int moved = 0;
-                    leftRange->MoveEndpointByUnit(TextPatternRangeEndpoint_Start,
-                                                  TextUnit_Character, -64, &moved);
-                    BSTR leftBstr = nullptr;
-                    if (SUCCEEDED(leftRange->GetText(256, &leftBstr)) && leftBstr) {
-                        leftUtf8 = wideToUtf8(std::wstring_view(leftBstr, ::SysStringLen(leftBstr)));
-                        ::SysFreeString(leftBstr);
-                    }
-                }
+    std::mutex queueMutex;
+    std::condition_variable queueCv;
+    std::shared_ptr<PendingTask> nextTask;
+    bool busy = false;
+    bool stop = false;
+    std::thread worker;
 
-                std::string rightUtf8;
-                ComPtr<IUIAutomationTextRange> rightRange;
-                if (SUCCEEDED(selRange->Clone(rightRange.put())) && rightRange) {
-                    rightRange->MoveEndpointByRange(TextPatternRangeEndpoint_Start, selRange.get(),
-                                                    TextPatternRangeEndpoint_End);
-                    int moved = 0;
-                    rightRange->MoveEndpointByUnit(TextPatternRangeEndpoint_End,
-                                                   TextUnit_Character, 32, &moved);
-                    BSTR rightBstr = nullptr;
-                    if (SUCCEEDED(rightRange->GetText(256, &rightBstr)) && rightBstr) {
-                        rightUtf8 =
-                            wideToUtf8(std::wstring_view(rightBstr, ::SysStringLen(rightBstr)));
-                        ::SysFreeString(rightBstr);
-                    }
-                }
+    Impl() {
+        worker = std::thread([this]() { workerLoop(); });
+    }
 
-                return yuntype::SurroundingSnapshot{
-                    leftUtf8 + selUtf8 + rightUtf8,
-                    leftUtf8.size(),
-                    leftUtf8.size() + selUtf8.size(),
-                };
-            }
+    ~Impl() {
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            stop = true;
+            nextTask.reset();
+        }
+        queueCv.notify_all();
+        if (worker.joinable()) {
+            worker.join();
         }
     }
 
-    // Fallback to classic Win32 Edit/RichEdit
-    if (fgWnd) {
-        const DWORD tid = ::GetWindowThreadProcessId(fgWnd, nullptr);
-        GUITHREADINFO gti{};
-        gti.cbSize = sizeof(gti);
-        if (::GetGUIThreadInfo(tid, &gti) && gti.hwndFocus) {
-            if (auto snap = readWin32EditSurrounding(gti.hwndFocus)) {
-                return snap;
+    // Run a COM/UIA task on the dedicated STA thread with a hard timeout so the caller
+    // (and WH_KEYBOARD_LL hook thread) NEVER stalls waiting on a hung app's accessibility tree.
+    bool runWithTimeout(std::function<void(IUIAutomation *)> fn,
+                        std::chrono::milliseconds timeout = kUiaTaskTimeout) {
+        auto task = std::make_shared<PendingTask>();
+        task->fn = std::move(fn);
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            if (stop || busy) {
+                return false; // Worker still busy on a slow app: degrade immediately
+            }
+            nextTask = task;
+        }
+        queueCv.notify_one();
+
+        std::unique_lock<std::mutex> dlock(task->doneMutex);
+        return task->doneCv.wait_for(dlock, timeout, [&]() { return task->done; });
+    }
+
+    void workerLoop() {
+        const HRESULT hr = ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        const bool comInit = SUCCEEDED(hr) || hr == S_FALSE;
+        ComPtr<IUIAutomation> uia;
+        ::CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER,
+                           IID_PPV_ARGS(uia.put()));
+
+        while (true) {
+            std::shared_ptr<PendingTask> task;
+            {
+                std::unique_lock<std::mutex> lock(queueMutex);
+                queueCv.wait(lock, [&]() { return stop || nextTask != nullptr; });
+                if (stop) {
+                    break;
+                }
+                task = std::move(nextTask);
+                busy = true;
+            }
+
+            if (task && task->fn) {
+                if (!uia) {
+                    ::CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER,
+                                       IID_PPV_ARGS(uia.put()));
+                }
+                task->fn(uia.get());
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(queueMutex);
+                busy = false;
+            }
+            if (task) {
+                {
+                    std::lock_guard<std::mutex> dlock(task->doneMutex);
+                    task->done = true;
+                }
+                task->doneCv.notify_all();
             }
         }
-        if (auto snap = readWin32EditSurrounding(fgWnd)) {
-            return snap;
+
+        uia.reset();
+        if (comInit) {
+            ::CoUninitialize();
         }
+    }
+};
+
+CaretTracker::CaretTracker() : impl_(new Impl()) {}
+
+CaretTracker::~CaretTracker() {
+    delete impl_;
+    impl_ = nullptr;
+}
+
+CaretAnchor CaretTracker::queryCaret(HWND fgWnd, std::optional<POINT> lastClickPt) {
+    auto result = std::make_shared<std::optional<CaretAnchor>>();
+    const bool finished = impl_->runWithTimeout([fgWnd, lastClickPt, result](IUIAutomation *uia) {
+        RECT rc{};
+        ComPtr<IUIAutomationElement> focusedElem;
+        if (uia && SUCCEEDED(uia->GetFocusedElement(focusedElem.put())) && focusedElem) {
+            ComPtr<IUIAutomationTextRange> range;
+            if (getSelectionRangeFromElement(focusedElem.get(), range) &&
+                getRectFromTextRange(range.get(), rc)) {
+                *result = CaretAnchor{rc, true};
+                return;
+            }
+        }
+        HWND focusHwnd = fgWnd;
+        if (queryGuiThreadCaret(fgWnd, rc, &focusHwnd)) {
+            *result = CaretAnchor{rc, true};
+            return;
+        }
+        if (queryMsaaCaret(focusHwnd, rc)) {
+            *result = CaretAnchor{rc, true};
+            return;
+        }
+        if (focusHwnd != fgWnd && queryMsaaCaret(fgWnd, rc)) {
+            *result = CaretAnchor{rc, true};
+            return;
+        }
+        if (lastClickPt && fgWnd) {
+            RECT wr{};
+            if (::GetWindowRect(fgWnd, &wr) && ::PtInRect(&wr, *lastClickPt)) {
+                *result = CaretAnchor{
+                    RECT{lastClickPt->x, lastClickPt->y, lastClickPt->x + 2, lastClickPt->y + 22},
+                    false};
+                return;
+            }
+        }
+        if (focusedElem) {
+            RECT elemRc{};
+            if (SUCCEEDED(focusedElem->get_CurrentBoundingRectangle(&elemRc)) &&
+                isSaneRect(elemRc)) {
+                *result = CaretAnchor{
+                    RECT{elemRc.left + 8, elemRc.bottom - 24, elemRc.left + 10, elemRc.bottom},
+                    false};
+                return;
+            }
+        }
+    });
+
+    if (finished && *result) {
+        return **result;
+    }
+    return fallbackCaretAnchor(fgWnd, lastClickPt);
+}
+
+std::optional<yuntype::SurroundingSnapshot> CaretTracker::readSurrounding(HWND fgWnd) {
+    auto result = std::make_shared<std::optional<yuntype::SurroundingSnapshot>>();
+    const bool finished = impl_->runWithTimeout([fgWnd, result](IUIAutomation *uia) {
+        if (uia) {
+            ComPtr<IUIAutomationElement> focusedElem;
+            if (SUCCEEDED(uia->GetFocusedElement(focusedElem.put())) && focusedElem) {
+                ComPtr<IUIAutomationTextRange> selRange;
+                if (getSelectionRangeFromElement(focusedElem.get(), selRange)) {
+                    BSTR selBstr = nullptr;
+                    std::string selUtf8;
+                    if (SUCCEEDED(selRange->GetText(2048, &selBstr)) && selBstr) {
+                        selUtf8 = wideToUtf8(std::wstring_view(selBstr, ::SysStringLen(selBstr)));
+                        ::SysFreeString(selBstr);
+                    }
+
+                    std::string leftUtf8;
+                    ComPtr<IUIAutomationTextRange> leftRange;
+                    if (SUCCEEDED(selRange->Clone(leftRange.put())) && leftRange) {
+                        leftRange->MoveEndpointByRange(TextPatternRangeEndpoint_End, selRange.get(),
+                                                       TextPatternRangeEndpoint_Start);
+                        int moved = 0;
+                        leftRange->MoveEndpointByUnit(TextPatternRangeEndpoint_Start,
+                                                      TextUnit_Character, -96, &moved);
+                        BSTR leftBstr = nullptr;
+                        if (SUCCEEDED(leftRange->GetText(512, &leftBstr)) && leftBstr) {
+                            leftUtf8 =
+                                wideToUtf8(std::wstring_view(leftBstr, ::SysStringLen(leftBstr)));
+                            ::SysFreeString(leftBstr);
+                        }
+                    }
+
+                    std::string rightUtf8;
+                    ComPtr<IUIAutomationTextRange> rightRange;
+                    if (SUCCEEDED(selRange->Clone(rightRange.put())) && rightRange) {
+                        rightRange->MoveEndpointByRange(TextPatternRangeEndpoint_Start,
+                                                        selRange.get(),
+                                                        TextPatternRangeEndpoint_End);
+                        int moved = 0;
+                        rightRange->MoveEndpointByUnit(TextPatternRangeEndpoint_End,
+                                                       TextUnit_Character, 32, &moved);
+                        BSTR rightBstr = nullptr;
+                        if (SUCCEEDED(rightRange->GetText(256, &rightBstr)) && rightBstr) {
+                            rightUtf8 =
+                                wideToUtf8(std::wstring_view(rightBstr, ::SysStringLen(rightBstr)));
+                            ::SysFreeString(rightBstr);
+                        }
+                    }
+
+                    *result = yuntype::SurroundingSnapshot{
+                        leftUtf8 + selUtf8 + rightUtf8,
+                        leftUtf8.size(),
+                        leftUtf8.size() + selUtf8.size(),
+                    };
+                    return;
+                }
+            }
+        }
+        if (HWND editHwnd = findWin32EditTarget(fgWnd)) {
+            *result = readWin32EditSurrounding(editHwnd);
+        }
+    });
+
+    if (finished && *result) {
+        return *result;
+    }
+    if (HWND editHwnd = findWin32EditTarget(fgWnd)) {
+        return readWin32EditSurrounding(editHwnd);
     }
     return std::nullopt;
+}
+
+bool CaretTracker::selectSuffixBeforeCaret(HWND fgWnd, std::string_view expectedSuffix) {
+    if (expectedSuffix.empty()) {
+        return false;
+    }
+    const std::string expected(expectedSuffix);
+    const int charCount = static_cast<int>(yuntype::utf8Length(expected));
+    if (charCount <= 0 || charCount > 1024) {
+        return false;
+    }
+
+    auto selected = std::make_shared<bool>(false);
+    const bool finished = impl_->runWithTimeout([fgWnd, expected, charCount, selected](IUIAutomation *uia) {
+        if (uia) {
+            ComPtr<IUIAutomationElement> focusedElem;
+            if (SUCCEEDED(uia->GetFocusedElement(focusedElem.put())) && focusedElem) {
+                ComPtr<IUIAutomationTextRange> caretRange;
+                if (getSelectionRangeFromElement(focusedElem.get(), caretRange)) {
+                    ComPtr<IUIAutomationTextRange> targetRange;
+                    if (SUCCEEDED(caretRange->Clone(targetRange.put())) && targetRange) {
+                        // Collapse to caret start, then extend start backward by charCount chars
+                        targetRange->MoveEndpointByRange(TextPatternRangeEndpoint_End,
+                                                         caretRange.get(),
+                                                         TextPatternRangeEndpoint_Start);
+                        int moved = 0;
+                        if (SUCCEEDED(targetRange->MoveEndpointByUnit(
+                                TextPatternRangeEndpoint_Start, TextUnit_Character, -charCount,
+                                &moved)) &&
+                            moved == -charCount) {
+                            BSTR bstr = nullptr;
+                            if (SUCCEEDED(targetRange->GetText(2048, &bstr)) && bstr) {
+                                const std::string actual =
+                                    wideToUtf8(std::wstring_view(bstr, ::SysStringLen(bstr)));
+                                ::SysFreeString(bstr);
+                                if (actual == expected && SUCCEEDED(targetRange->Select())) {
+                                    *selected = true;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (HWND editHwnd = findWin32EditTarget(fgWnd)) {
+            if (selectWin32EditSuffix(editHwnd, expected)) {
+                *selected = true;
+            }
+        }
+    });
+
+    return finished && *selected;
 }
 
 } // namespace yuntype::win

@@ -86,13 +86,10 @@ void sendInputBatched(const std::vector<INPUT> &inputs) {
     if (inputs.empty()) {
         return;
     }
-    constexpr std::size_t kChunk = 64;
+    constexpr std::size_t kChunk = 512;
     for (std::size_t i = 0; i < inputs.size(); i += kChunk) {
         const std::size_t n = std::min(kChunk, inputs.size() - i);
         ::SendInput(static_cast<UINT>(n), const_cast<INPUT *>(inputs.data() + i), sizeof(INPUT));
-        if (i + n < inputs.size()) {
-            ::Sleep(1);
-        }
     }
 }
 
