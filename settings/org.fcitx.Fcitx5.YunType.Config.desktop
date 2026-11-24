@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Fcitx5 YunType Settings
+Name[zh_CN]=云打（YunType）整句输入设置
+Comment=Configure Fcitx5 YunType LLM full-sentence pinyin conversion and model services
+Comment[zh_CN]=配置 Fcitx5 云打大模型整句拼音转换、跨窗口历史与模型服务
+Exec=fcitx5-yuntype-config
+Icon=preferences-desktop-keyboard
+Terminal=false
+Type=Application
+Categories=Settings;DesktopSettings;Utility;
+Keywords=fcitx5;yuntype;pinyin;llm;ime;中文;输入法;整句;大模型;云打;
+StartupNotify=true
