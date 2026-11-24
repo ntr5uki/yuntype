@@ -166,10 +166,15 @@ inline constexpr const char *kSettingsPageHtml = R"YUNTYPE_HTML(<!doctype html>
     </div>
     <div class="row">
       <label>触发快捷键</label>
-      <div>
-        <input type="text" id="triggerKey" placeholder="Alt+U">
-        <div class="hint">支持 Alt+U、Ctrl+Shift+U、Alt+Space、F9 等组合键</div>
-      </div>
+      <select id="triggerKey">
+        <option value="Alt+U">Alt + U（默认）</option>
+        <option value="Ctrl+U">Ctrl + U</option>
+        <option value="Ctrl+Shift+U">Ctrl + Shift + U</option>
+        <option value="Alt+S">Alt + S</option>
+        <option value="Ctrl+Shift+S">Ctrl + Shift + S</option>
+        <option value="Alt+Space">Alt + Space</option>
+        <option value="F9">F9</option>
+      </select>
     </div>
     <div class="row">
       <label>短输入候选拼音长度阈值</label>
@@ -470,7 +475,15 @@ document.getElementById('btnClearHistory').onclick = async () => {
   try {
     state = await api('/api/state');
     document.getElementById('enabled').checked = !!state.enabled;
-    document.getElementById('triggerKey').value = state.trigger_key || 'Alt+U';
+    const rawKey = (state.trigger_key || 'Alt+U').replace(/^Control\+/i, 'Ctrl+');
+    const tkEl = document.getElementById('triggerKey');
+    if (!Array.from(tkEl.options).some(o => o.value === rawKey)) {
+      const opt = document.createElement('option');
+      opt.value = rawKey;
+      opt.textContent = rawKey;
+      tkEl.appendChild(opt);
+    }
+    tkEl.value = rawKey;
     document.getElementById('shortThreshold').value = state.short_candidate_threshold ?? 50;
     document.getElementById('pageSize').value = state.candidate_page_size ?? 5;
     document.getElementById('autoStart').checked = !!state.auto_start;

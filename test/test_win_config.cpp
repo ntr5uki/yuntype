@@ -20,6 +20,14 @@ int main() {
     {
         auto t1 = parseTriggerKey("Alt+U");
         CHECK(t1.modifiers == 1U && t1.vk == 'U');
+        auto tCtrlU = parseTriggerKey("Ctrl+U");
+        CHECK(tCtrlU.modifiers == 2U && tCtrlU.vk == 'U');
+        auto tControlU = parseTriggerKey("Control+U");
+        CHECK(tControlU.modifiers == 2U && tControlU.vk == 'U');
+        auto tAltS = parseTriggerKey("Alt+S");
+        CHECK(tAltS.modifiers == 1U && tAltS.vk == 'S');
+        auto tCtrlShiftS = parseTriggerKey("Ctrl+Shift+S");
+        CHECK(tCtrlShiftS.modifiers == (2U | 4U) && tCtrlShiftS.vk == 'S');
         auto t2 = parseTriggerKey("Ctrl+Shift+Space");
         CHECK(t2.modifiers == (2U | 4U) && t2.vk == 0x20);
         auto t3 = parseTriggerKey("F9");

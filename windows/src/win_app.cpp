@@ -290,7 +290,8 @@ bool WinApp::initTrayIcon() {
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_YT_TRAY;
     nid.hIcon = trayIcon_ ? trayIcon_ : ::LoadIconW(nullptr, IDI_APPLICATION);
-    ::wcsncpy(nid.szTip, L"\u4E91\u6253 YunType (Alt+U)", std::size(nid.szTip) - 1);
+    const std::wstring tip = L"\u4E91\u6253 YunType (" + utf8ToWide(config_.triggerKey) + L")";
+    ::wcsncpy(nid.szTip, tip.c_str(), std::size(nid.szTip) - 1);
     return ::Shell_NotifyIconW(NIM_ADD, &nid) != FALSE;
 }
 
@@ -424,6 +425,16 @@ void WinApp::reloadConfigAndSync() {
     triggerSpec_ = parseTriggerKey(snap.triggerKey);
     enabledAtomic_.store(snap.enabled);
     client_.configure(snap.toLlmConfig(configDir_ + "\\api.key"));
+    if (ctrlHwnd_) {
+        NOTIFYICONDATAW nid{};
+        nid.cbSize = sizeof(nid);
+        nid.hWnd = ctrlHwnd_;
+        nid.uID = kTrayIconId;
+        nid.uFlags = NIF_TIP;
+        const std::wstring tip = L"\u4E91\u6253 YunType (" + utf8ToWide(snap.triggerKey) + L")";
+        ::wcsncpy(nid.szTip, tip.c_str(), std::size(nid.szTip) - 1);
+        ::Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
     if (!snap.historyEnabled) {
         historyDraft_.reset();
         shadowDraft_.reset();
@@ -1453,7 +1464,7 @@ void WinApp::refreshOverlay() {
         model.hasMoreAction = (pc.loadMoreRounds < kMaxLoadMoreRounds && !pc.sessionTurns.empty());
     } else if (draftActive_) {
         model.visible = true;
-        model.preedit = draft_.empty() ? "输入拼音，Enter/Alt+U 转换" : draft_;
+        model.preedit = draft_.empty() ? ("输入拼音，Enter/" + config_.triggerKey + " 转换") : draft_;
         model.preeditCursorByte = draft_.empty() ? 0 : draftCursor_;
         model.showDraftCaret = !draft_.empty();
     } else if (!queue_.empty()) {
