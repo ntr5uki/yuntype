@@ -26,8 +26,8 @@ Fcitx 5 后台常驻的大模型整句拼音转换模块（`Category=Module`）�
 ## 构建与打包（Arch Linux）
 
 ```bash
-./scripts/package-arch.sh 0.1.19-1 dist
-sudo pacman -U dist/fcitx5-yuntype-0.1.19-1-x86_64.pkg.tar.zst
+./scripts/package-arch.sh 0.1.20-1 dist
+sudo pacman -U dist/fcitx5-yuntype-0.1.20-1-x86_64.pkg.tar.zst
 ```
 
 ## 构建与运行（Windows 10 / 11 伴随工具壳）

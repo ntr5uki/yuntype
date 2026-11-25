@@ -161,6 +161,51 @@ bool isTerminalWindow(HWND hwnd) {
            v.find(L"Terminal") != std::wstring_view::npos;
 }
 
+bool isUnsafeEmptyCtrlCWindow(HWND hwnd) {
+    if (!hwnd || isTerminalWindow(hwnd)) {
+        return true;
+    }
+    wchar_t cls[128]{};
+    const int n = ::GetClassNameW(hwnd, cls, static_cast<int>(std::size(cls)));
+    if (n <= 0) {
+        return false;
+    }
+    const std::wstring_view v(cls, static_cast<std::size_t>(n));
+    return v.starts_with(L"Chrome_WidgetWin_") ||
+           v == L"SunAwtFrame" ||
+           v == L"PX_WINDOW_CLASS";
+}
+
+ScintillaSelectionState queryScintillaSelection(HWND fgWnd) {
+    if (!fgWnd) {
+        return ScintillaSelectionState::NotScintilla;
+    }
+    const DWORD tid = ::GetWindowThreadProcessId(fgWnd, nullptr);
+    GUITHREADINFO gti{};
+    gti.cbSize = sizeof(gti);
+    HWND focus = fgWnd;
+    if (::GetGUIThreadInfo(tid, &gti) && gti.hwndFocus) {
+        focus = gti.hwndFocus;
+    }
+    wchar_t cls[64]{};
+    const int n = ::GetClassNameW(focus, cls, static_cast<int>(std::size(cls)));
+    if (n <= 0 || std::wstring_view(cls, static_cast<std::size_t>(n)) != L"Scintilla") {
+        return ScintillaSelectionState::NotScintilla;
+    }
+    constexpr UINT kSciGetSelectionStart = 2143;
+    constexpr UINT kSciGetSelectionEnd = 2145;
+    DWORD_PTR selStart = 0;
+    DWORD_PTR selEnd = 0;
+    if (!::SendMessageTimeoutW(focus, kSciGetSelectionStart, 0, 0,
+                               SMTO_ABORTIFHUNG, 30, &selStart) ||
+        !::SendMessageTimeoutW(focus, kSciGetSelectionEnd, 0, 0,
+                               SMTO_ABORTIFHUNG, 30, &selEnd)) {
+        return ScintillaSelectionState::NotScintilla;
+    }
+    return (selStart != selEnd) ? ScintillaSelectionState::NonEmpty
+                                : ScintillaSelectionState::Empty;
+}
+
 namespace {
 
 bool openClipboardRetry(int maxTries = 6) {
@@ -296,7 +341,7 @@ std::optional<std::string> readSelectionViaClipboard(HWND fgWnd) {
     sendInputBatched(inputs);
 
     bool changed = false;
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < 12; ++i) {
         ::Sleep(5);
         if (::GetClipboardSequenceNumber() != seqBefore) {
             changed = true;

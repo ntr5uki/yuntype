@@ -39,6 +39,7 @@ constexpr UINT WM_YT_FG_CHANGED = WM_APP + 5;
 constexpr UINT WM_YT_RELOAD_CONFIG = WM_APP + 6;
 constexpr UINT WM_YT_CLEAR_HISTORY = WM_APP + 7;
 constexpr UINT WM_YT_MOUSE_CLICK = WM_APP + 8;
+constexpr UINT WM_YT_CAPTURE_START = WM_APP + 9;
 
 constexpr UINT IDM_TOGGLE_ENABLED = 3001;
 constexpr UINT IDM_OPEN_SETTINGS = 3002;
@@ -197,6 +198,10 @@ WinApp::~WinApp() {
         ::UnhookWinEvent(fgHook_);
         fgHook_ = nullptr;
     }
+    if (captureHook_) {
+        ::UnhookWinEvent(captureHook_);
+        captureHook_ = nullptr;
+    }
     if (kbHook_) {
         ::UnhookWindowsHookEx(kbHook_);
         kbHook_ = nullptr;
@@ -256,7 +261,11 @@ int WinApp::run(HINSTANCE hInst) {
     fgHook_ = ::SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
                                 &WinApp::winEventProc, 0, 0,
                                 WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    captureHook_ = ::SetWinEventHook(EVENT_SYSTEM_CAPTURESTART, EVENT_SYSTEM_CAPTURESTART, nullptr,
+                                     &WinApp::winEventProc, 0, 0,
+                                     WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     lastFgWnd_ = ::GetForegroundWindow();
+    lastFgChangedUsec_ = monotonicNowUsec();
 
     if (config_.historyEnabled) {
         pollCompaction();
@@ -587,6 +596,9 @@ LRESULT CALLBACK WinApp::ctrlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     case WM_YT_FG_CHANGED:
         self->onForegroundChanged(reinterpret_cast<HWND>(wp));
         return 0;
+    case WM_YT_CAPTURE_START:
+        self->onCaptureStart(reinterpret_cast<HWND>(wp));
+        return 0;
     case WM_YT_MOUSE_CLICK:
         self->onMouseClick(POINT{static_cast<LONG>(wp), static_cast<LONG>(lp)});
         return 0;
@@ -715,8 +727,13 @@ void WinApp::syncMouseHook(bool active) {
 }
 
 void CALLBACK WinApp::winEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG, LONG, DWORD, DWORD) {
-    if (event == EVENT_SYSTEM_FOREGROUND && instance_ && instance_->ctrlHwnd_) {
+    if (!instance_ || !instance_->ctrlHwnd_) {
+        return;
+    }
+    if (event == EVENT_SYSTEM_FOREGROUND) {
         ::PostMessageW(instance_->ctrlHwnd_, WM_YT_FG_CHANGED, reinterpret_cast<WPARAM>(hwnd), 0);
+    } else if (event == EVENT_SYSTEM_CAPTURESTART) {
+        ::PostMessageW(instance_->ctrlHwnd_, WM_YT_CAPTURE_START, reinterpret_cast<WPARAM>(hwnd), 0);
     }
 }
 
@@ -757,10 +774,12 @@ void WinApp::onForegroundChanged(HWND newFg) {
         saveWindowAscii(lastFgWnd_);
         appAscii_.clear();
         selectionLikely_ = false;
+        mouseCaptureSeen_ = false;
         lastCommittedText_.clear();
         historyDraft_.reset();
         shadowDraft_.reset();
         lastFgWnd_ = newFg;
+        lastFgChangedUsec_ = monotonicNowUsec();
         if (newFg) {
             auto it = savedWindowAscii_.find(newFg);
             if (it != savedWindowAscii_.end()) {
@@ -771,6 +790,26 @@ void WinApp::onForegroundChanged(HWND newFg) {
                 }
                 savedWindowAscii_.erase(it);
             }
+        }
+    }
+}
+
+void WinApp::onCaptureStart(HWND hwnd) {
+    if (!hwnd || hwnd == overlay_.hwnd() || hwnd == ctrlHwnd_) {
+        return;
+    }
+    HWND root = ::GetAncestor(hwnd, GA_ROOT);
+    if (!root) {
+        root = hwnd;
+    }
+    if (root == lastFgWnd_) {
+        mouseCaptureSeen_ = true;
+        const std::uint64_t now = monotonicNowUsec();
+        // Keep freshly restored per-window ASCII on immediate window-refocus clicks;
+        // clear stale tracked ASCII for mid-session clicks/drags inside the active window.
+        if (now >= lastFgChangedUsec_ && (now - lastFgChangedUsec_) >= 200000ULL) {
+            appAscii_.clear();
+            savedWindowAscii_.erase(lastFgWnd_);
         }
     }
 }
@@ -825,6 +864,7 @@ void WinApp::onTrigger() {
     if (fg && fg != lastFgWnd_) {
         saveWindowAscii(lastFgWnd_);
         lastFgWnd_ = fg;
+        lastFgChangedUsec_ = monotonicNowUsec();
         if (appAscii_.empty()) {
             auto it = savedWindowAscii_.find(fg);
             if (it != savedWindowAscii_.end()) {
@@ -846,6 +886,7 @@ void WinApp::onTrigger() {
         std::string selected = snap->text.substr(snap->start, snap->end - snap->start);
         if (yuntype::hasAsciiAlpha(selected)) {
             selectionLikely_ = false;
+            mouseCaptureSeen_ = false;
             appAscii_.clear();
             if (fg) {
                 savedWindowAscii_.erase(fg);
@@ -855,12 +896,22 @@ void WinApp::onTrigger() {
         }
     }
 
-    // 1b. Active selection in non-UIA apps (WeChat, Notepad3/Scintilla, WPS):
-    //     Only fire silent Ctrl+C when an explicit keyboard selection gesture occurred
-    //     (Ctrl+A, Shift/Ctrl+Shift + navigation) so Scintilla never accidentally copies
-    //     an unselected line.
-    if (selectionLikely_) {
-        selectionLikely_ = false;
+    // 1b. Active selection in non-UIA apps without any idle mouse hook:
+    //     - Scintilla (Notepad3 / Notepad++): exact native SCI_GETSELECTIONSTART/END check so
+    //       mouse drags, double-clicks, and Ctrl+A all work while never copying an unselected line.
+    //     - Explicit keyboard selections (Ctrl+A, Shift/Ctrl+Shift + navigation) in any non-UIA app.
+    //     - WeChat / WPS (safe empty-Ctrl+C apps): probe silent Ctrl+C when mouse capture occurred
+    //       or tracked ASCII is empty (mouse drag / double-click on earlier lines).
+    const auto sciState = queryScintillaSelection(fg);
+    const bool tryClipboardSelection =
+        (sciState == ScintillaSelectionState::NonEmpty) ||
+        (selectionLikely_ && sciState != ScintillaSelectionState::Empty) ||
+        (sciState == ScintillaSelectionState::NotScintilla &&
+         !isUnsafeEmptyCtrlCWindow(fg) &&
+         (mouseCaptureSeen_ || appAscii_.empty()));
+    selectionLikely_ = false;
+    mouseCaptureSeen_ = false;
+    if (tryClipboardSelection) {
         if (auto clipSel = readSelectionViaClipboard(fg)) {
             if (yuntype::hasAsciiAlpha(*clipSel)) {
                 appAscii_.clear();
@@ -964,6 +1015,7 @@ void WinApp::onPassiveKey(DWORD vk, bool shift, bool ctrl, bool alt, char asciiC
             appAscii_.clear();
             if (!(ctrl && !alt && vk == 'C')) {
                 selectionLikely_ = false;
+                mouseCaptureSeen_ = false;
             }
         }
         return;
@@ -971,6 +1023,7 @@ void WinApp::onPassiveKey(DWORD vk, bool shift, bool ctrl, bool alt, char asciiC
 
     if (asciiCh >= 0x20 && asciiCh <= 0x7E) {
         selectionLikely_ = false;
+        mouseCaptureSeen_ = false;
         if (isForegroundChineseImeActive()) {
             appAscii_.clear();
             return;
@@ -992,6 +1045,7 @@ void WinApp::onPassiveKey(DWORD vk, bool shift, bool ctrl, bool alt, char asciiC
     switch (vk) {
     case VK_BACK:
         selectionLikely_ = false;
+        mouseCaptureSeen_ = false;
         if (!appAscii_.empty()) {
             appAscii_.pop_back();
         }
@@ -1004,6 +1058,7 @@ void WinApp::onPassiveKey(DWORD vk, bool shift, bool ctrl, bool alt, char asciiC
         break;
     case VK_DELETE:
         selectionLikely_ = false;
+        mouseCaptureSeen_ = false;
         appAscii_.clear();
         if (config_.historyEnabled && shadowDraft_) {
             if (history_.shadowDelete(shadowDraft_, ++historyRevision_, now, kShadowTimeoutUsec)) {
@@ -1013,6 +1068,7 @@ void WinApp::onPassiveKey(DWORD vk, bool shift, bool ctrl, bool alt, char asciiC
         break;
     case VK_LEFT:
         selectionLikely_ = false;
+        mouseCaptureSeen_ = false;
         appAscii_.clear();
         if (config_.historyEnabled && shadowDraft_) {
             history_.shadowMoveLeft(shadowDraft_, now, kShadowTimeoutUsec);
@@ -1020,6 +1076,7 @@ void WinApp::onPassiveKey(DWORD vk, bool shift, bool ctrl, bool alt, char asciiC
         break;
     case VK_RIGHT:
         selectionLikely_ = false;
+        mouseCaptureSeen_ = false;
         appAscii_.clear();
         if (config_.historyEnabled && shadowDraft_) {
             history_.shadowMoveRight(shadowDraft_, now, kShadowTimeoutUsec);
@@ -1035,6 +1092,7 @@ void WinApp::onPassiveKey(DWORD vk, bool shift, bool ctrl, bool alt, char asciiC
     case VK_TAB:
     case VK_ESCAPE:
         selectionLikely_ = false;
+        mouseCaptureSeen_ = false;
         appAscii_.clear();
         shadowDraft_.reset();
         break;
@@ -1362,6 +1420,7 @@ void WinApp::commitSentenceResult(std::string committed, std::string turnJson,
                                   std::string_view eraseSuffix, bool replaceSelection) {
     appAscii_.clear();
     selectionLikely_ = false;
+    mouseCaptureSeen_ = false;
     if (!hasActiveSession()) {
         overlay_.hide();
         syncMouseHook(false);
@@ -1755,6 +1814,7 @@ void WinApp::resetActiveSession() {
     draftEraseSuffix_.clear();
     draftReplaceSelection_ = false;
     selectionLikely_ = false;
+    mouseCaptureSeen_ = false;
     queue_.clear();
     pendingCandidates_.reset();
     activeSessionAtomic_.store(false);

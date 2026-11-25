@@ -28,6 +28,19 @@ void suppressAltMenuActivation();
 // Detect common terminal emulators where Ctrl+C would send SIGINT.
 bool isTerminalWindow(HWND hwnd);
 
+// Detect windows where sending Ctrl+C with no selection is unsafe or copies the whole line
+// (terminals, Chromium/Electron/VS Code, JetBrains, Sublime).
+bool isUnsafeEmptyCtrlCWindow(HWND hwnd);
+
+enum class ScintillaSelectionState {
+    NotScintilla,
+    Empty,
+    NonEmpty,
+};
+
+// Query native Scintilla (Notepad3 / Notepad++) focused control selection state without clipboard.
+ScintillaSelectionState queryScintillaSelection(HWND fgWnd);
+
 // Read an active text selection via silent Ctrl+C (backing up and restoring original clipboard
 // text with Win11 history-exclusion flags). Skips terminals. Returns std::nullopt if unchanged.
 std::optional<std::string> readSelectionViaClipboard(HWND fgWnd);

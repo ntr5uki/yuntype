@@ -89,6 +89,7 @@ private:
     void onActiveKey(DWORD vk, bool shift, bool ctrl, bool alt, char asciiCh);
     void onPassiveKey(DWORD vk, bool shift, bool ctrl, bool alt, char asciiCh);
     void onForegroundChanged(HWND newFg);
+    void onCaptureStart(HWND hwnd);
     void onMouseClick(POINT pt);
     void saveWindowAscii(HWND hwnd);
     void syncMouseHook(bool active);
@@ -125,6 +126,7 @@ private:
     HHOOK kbHook_ = nullptr;
     HHOOK mouseHook_ = nullptr;
     HWINEVENTHOOK fgHook_ = nullptr;
+    HWINEVENTHOOK captureHook_ = nullptr;
 
     std::string configDir_;
     std::string dataDir_;
@@ -160,11 +162,13 @@ private:
     };
 
     HWND lastFgWnd_ = nullptr;
+    std::uint64_t lastFgChangedUsec_ = 0;
     RECT activeAnchor_{};
 
     std::string appAscii_;
     std::unordered_map<HWND, SavedWindowAscii> savedWindowAscii_;
     bool selectionLikely_ = false;
+    bool mouseCaptureSeen_ = false;
     bool pollTimerActive_ = false;
     bool compactionTimerActive_ = false;
     bool persistTimerActive_ = false;

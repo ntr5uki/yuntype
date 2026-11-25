@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-RAW_VERSION=${1:-0.1.19-1}
+RAW_VERSION=${1:-0.1.20-1}
 if [[ "$RAW_VERSION" == *-* ]]; then
   VERSION="${RAW_VERSION%-*}"
   PKGREL="${RAW_VERSION##*-}"
