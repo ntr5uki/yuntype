@@ -90,8 +90,15 @@ private:
     void onPassiveKey(DWORD vk, bool shift, bool ctrl, bool alt, char asciiCh);
     void onForegroundChanged(HWND newFg);
     void onMouseClick(POINT pt);
-    void onMouseUp(POINT pt);
     void saveWindowAscii(HWND hwnd);
+    void syncMouseHook(bool active);
+    void syncPollTimer();
+    void syncCompactionTimer();
+    void schedulePersistTimer();
+    void schedulePostCommitSync();
+    void cancelPostCommitSync();
+    void onPersistTimer();
+    void onPostCommitSyncTimer();
 
     void handleDraftKey(DWORD vk, bool ctrl, char asciiCh);
     void handleQueueKey(DWORD vk, char asciiCh);
@@ -107,7 +114,6 @@ private:
                               std::string_view eraseSuffix, bool replaceSelection = false);
 
     yuntype::SentenceContext buildHistoryContext(bool candidateMode);
-    void pollTimers();
     void pollQueue();
     void pollCompaction();
     void refreshOverlay();
@@ -154,17 +160,15 @@ private:
     };
 
     HWND lastFgWnd_ = nullptr;
-    std::optional<POINT> lastClickPt_;
     RECT activeAnchor_{};
 
     std::string appAscii_;
     std::unordered_map<HWND, SavedWindowAscii> savedWindowAscii_;
     bool selectionLikely_ = false;
-    POINT mouseDownPt_{};
-    bool mouseDownValid_ = false;
-    bool mouseDownInClient_ = false;
-    std::uint64_t lastClickMs_ = 0;
-    POINT prevClickPt_{};
+    bool pollTimerActive_ = false;
+    bool compactionTimerActive_ = false;
+    bool persistTimerActive_ = false;
+    bool postCommitTimerActive_ = false;
     bool draftActive_ = false;
     std::string draft_;
     std::size_t draftCursor_ = 0;

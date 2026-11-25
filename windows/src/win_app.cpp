@@ -10,7 +10,6 @@
 
 #include <algorithm>
 #include <cctype>
-#include <cstdlib>
 #include <filesystem>
 
 namespace yuntype::win {
@@ -20,7 +19,12 @@ namespace {
 constexpr wchar_t kCtrlClassName[] = L"YunTypeWinControllerWnd";
 constexpr UINT kTrayIconId = 1001;
 constexpr UINT kTimerPollId = 2001;
+constexpr UINT kTimerCompactionId = 2002;
+constexpr UINT kTimerPersistId = 2003;
+constexpr UINT kTimerPostCommitId = 2004;
 constexpr UINT kPollIntervalMs = 40;
+constexpr UINT kCompactionIntervalMs = 100;
+constexpr UINT kPostCommitSyncMs = 300;
 constexpr std::size_t kMaxAsciiTrackBytes = 512;
 constexpr int kMaxLoadMoreRounds = 5;
 constexpr std::uint64_t kShadowTimeoutUsec = 30ULL * 1000 * 1000;
@@ -35,28 +39,12 @@ constexpr UINT WM_YT_FG_CHANGED = WM_APP + 5;
 constexpr UINT WM_YT_RELOAD_CONFIG = WM_APP + 6;
 constexpr UINT WM_YT_CLEAR_HISTORY = WM_APP + 7;
 constexpr UINT WM_YT_MOUSE_CLICK = WM_APP + 8;
-constexpr UINT WM_YT_MOUSE_UP = WM_APP + 9;
 
 constexpr UINT IDM_TOGGLE_ENABLED = 3001;
 constexpr UINT IDM_OPEN_SETTINGS = 3002;
 constexpr UINT IDM_CLEAR_HISTORY = 3003;
 constexpr UINT IDM_AUTO_START = 3004;
 constexpr UINT IDM_EXIT = 3005;
-
-bool isPointInWindowClient(HWND hwnd, POINT pt) {
-    if (!hwnd || !::IsWindow(hwnd)) {
-        return false;
-    }
-    POINT local = pt;
-    if (!::ScreenToClient(hwnd, &local)) {
-        return false;
-    }
-    RECT rc{};
-    if (!::GetClientRect(hwnd, &rc)) {
-        return false;
-    }
-    return ::PtInRect(&rc, local) != FALSE;
-}
 
 bool isForegroundChineseImeActive() {
     HWND fg = ::GetForegroundWindow();
@@ -265,13 +253,14 @@ int WinApp::run(HINSTANCE hInst) {
     initTrayIcon();
 
     kbHook_ = ::SetWindowsHookExW(WH_KEYBOARD_LL, &WinApp::lowLevelKeyboardProc, hInst, 0);
-    mouseHook_ = ::SetWindowsHookExW(WH_MOUSE_LL, &WinApp::lowLevelMouseProc, hInst, 0);
     fgHook_ = ::SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
                                 &WinApp::winEventProc, 0, 0,
                                 WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     lastFgWnd_ = ::GetForegroundWindow();
 
-    ::SetTimer(ctrlHwnd_, kTimerPollId, kPollIntervalMs, nullptr);
+    if (config_.historyEnabled) {
+        pollCompaction();
+    }
 
     // First-run convenience: open settings if no model API key / config existed yet
     if (!hadConfig || !client_.config().isReady()) {
@@ -456,9 +445,13 @@ void WinApp::reloadConfigAndSync() {
         ::Shell_NotifyIconW(NIM_MODIFY, &nid);
     }
     if (!snap.historyEnabled) {
+        client_.cancelCompaction();
         historyDraft_.reset();
         shadowDraft_.reset();
+        cancelPostCommitSync();
     }
+    syncCompactionTimer();
+    schedulePersistTimer();
 }
 
 void WinApp::loadHistoryFromDisk() {
@@ -472,12 +465,14 @@ void WinApp::loadHistoryFromDisk() {
 
 void WinApp::flushHistoryToDisk() {
     if (!historyDirty_ || historyPath_.empty()) {
+        schedulePersistTimer();
         return;
     }
     if (history_.saveToFile(historyPath_, notesSentThrough_)) {
         historyDirty_ = false;
         historyDirtySinceUsec_ = 0;
     }
+    schedulePersistTimer();
 }
 
 void WinApp::markHistoryDirty() {
@@ -490,6 +485,7 @@ void WinApp::markHistoryDirty() {
         historyDirtySinceUsec_ = now;
     }
     historyLastMutatedUsec_ = now;
+    schedulePersistTimer();
 }
 
 void WinApp::onHistoryMutated() {
@@ -498,6 +494,7 @@ void WinApp::onHistoryMutated() {
         client_.cancelCompaction();
         history_.deferCompaction();
     }
+    pollCompaction();
 }
 
 void WinApp::clearHistory() {
@@ -509,6 +506,9 @@ void WinApp::clearHistory() {
     notesSentThrough_ = 0;
     historyDraft_.reset();
     shadowDraft_.reset();
+    cancelPostCommitSync();
+    syncCompactionTimer();
+    schedulePersistTimer();
     std::error_code ec;
     const std::filesystem::path p(
         std::u8string(reinterpret_cast<const char8_t *>(historyPath_.data()), historyPath_.size()));
@@ -590,9 +590,6 @@ LRESULT CALLBACK WinApp::ctrlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     case WM_YT_MOUSE_CLICK:
         self->onMouseClick(POINT{static_cast<LONG>(wp), static_cast<LONG>(lp)});
         return 0;
-    case WM_YT_MOUSE_UP:
-        self->onMouseUp(POINT{static_cast<LONG>(wp), static_cast<LONG>(lp)});
-        return 0;
     case WM_YT_RELOAD_CONFIG:
         self->reloadConfigAndSync();
         return 0;
@@ -600,12 +597,32 @@ LRESULT CALLBACK WinApp::ctrlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         self->clearHistory();
         return 0;
     case WM_TIMER:
-        if (wp == kTimerPollId) {
-            self->pollTimers();
+        switch (wp) {
+        case kTimerPollId:
+            self->pollQueue();
+            break;
+        case kTimerCompactionId:
+            self->pollCompaction();
+            break;
+        case kTimerPersistId:
+            self->onPersistTimer();
+            break;
+        case kTimerPostCommitId:
+            self->onPostCommitSyncTimer();
+            break;
+        default:
+            break;
         }
         return 0;
     case WM_DESTROY:
         ::KillTimer(hwnd, kTimerPollId);
+        ::KillTimer(hwnd, kTimerCompactionId);
+        ::KillTimer(hwnd, kTimerPersistId);
+        ::KillTimer(hwnd, kTimerPostCommitId);
+        self->pollTimerActive_ = false;
+        self->compactionTimerActive_ = false;
+        self->persistTimerActive_ = false;
+        self->postCommitTimerActive_ = false;
         return 0;
     default:
         return ::DefWindowProcW(hwnd, msg, wp, lp);
@@ -676,23 +693,25 @@ LRESULT CALLBACK WinApp::lowLevelKeyboardProc(int code, WPARAM wp, LPARAM lp) {
 
 LRESULT CALLBACK WinApp::lowLevelMouseProc(int code, WPARAM wp, LPARAM lp) {
     WinApp *self = instance_;
-    if (code == HC_ACTION && self) {
-        if (wp == WM_LBUTTONDOWN) {
-            const auto *ms = reinterpret_cast<const MSLLHOOKSTRUCT *>(lp);
-            self->lastClickPt_ = ms->pt;
-            if (self->ctrlHwnd_) {
-                ::PostMessageW(self->ctrlHwnd_, WM_YT_MOUSE_CLICK,
-                               static_cast<WPARAM>(ms->pt.x), static_cast<LPARAM>(ms->pt.y));
-            }
-        } else if (wp == WM_LBUTTONUP) {
-            const auto *ms = reinterpret_cast<const MSLLHOOKSTRUCT *>(lp);
-            if (self->ctrlHwnd_) {
-                ::PostMessageW(self->ctrlHwnd_, WM_YT_MOUSE_UP,
-                               static_cast<WPARAM>(ms->pt.x), static_cast<LPARAM>(ms->pt.y));
-            }
+    if (code == HC_ACTION && self && wp == WM_LBUTTONDOWN) {
+        const auto *ms = reinterpret_cast<const MSLLHOOKSTRUCT *>(lp);
+        if (self->ctrlHwnd_) {
+            ::PostMessageW(self->ctrlHwnd_, WM_YT_MOUSE_CLICK,
+                           static_cast<WPARAM>(ms->pt.x), static_cast<LPARAM>(ms->pt.y));
         }
     }
     return ::CallNextHookEx(nullptr, code, wp, lp);
+}
+
+void WinApp::syncMouseHook(bool active) {
+    if (active) {
+        if (!mouseHook_ && hInst_) {
+            mouseHook_ = ::SetWindowsHookExW(WH_MOUSE_LL, &WinApp::lowLevelMouseProc, hInst_, 0);
+        }
+    } else if (mouseHook_) {
+        ::UnhookWindowsHookEx(mouseHook_);
+        mouseHook_ = nullptr;
+    }
 }
 
 void CALLBACK WinApp::winEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG, LONG, DWORD, DWORD) {
@@ -734,6 +753,7 @@ void WinApp::onForegroundChanged(HWND newFg) {
         if (hasActiveSession()) {
             resetActiveSession();
         }
+        cancelPostCommitSync();
         saveWindowAscii(lastFgWnd_);
         appAscii_.clear();
         selectionLikely_ = false;
@@ -756,65 +776,17 @@ void WinApp::onForegroundChanged(HWND newFg) {
 }
 
 void WinApp::onMouseClick(POINT pt) {
+    if (!hasActiveSession()) {
+        syncMouseHook(false);
+        return;
+    }
     if (overlay_.isVisible() && overlay_.hwnd()) {
         RECT ovRc{};
         if (::GetWindowRect(overlay_.hwnd(), &ovRc) && ::PtInRect(&ovRc, pt)) {
             return; // Click is inside the overlay (candidate selection)
         }
     }
-
-    const std::uint64_t nowMs = ::GetTickCount64();
-    const bool isDblClick =
-        lastClickMs_ != 0 && nowMs >= lastClickMs_ &&
-        (nowMs - lastClickMs_) <= ::GetDoubleClickTime() &&
-        std::abs(pt.x - prevClickPt_.x) <= 4 && std::abs(pt.y - prevClickPt_.y) <= 4;
-    lastClickMs_ = nowMs;
-    prevClickPt_ = pt;
-
-    HWND hitWnd = ::WindowFromPoint(pt);
-    HWND hitRoot = hitWnd ? ::GetAncestor(hitWnd, GA_ROOT) : nullptr;
-    HWND activeFg = lastFgWnd_ ? lastFgWnd_ : ::GetForegroundWindow();
-    const bool inClient = hitRoot && isPointInWindowClient(hitRoot, pt);
-
-    mouseDownPt_ = pt;
-    mouseDownValid_ = true;
-    mouseDownInClient_ = inClient;
-    selectionLikely_ = isDblClick && inClient;
-
-    if (hitRoot && activeFg && hitRoot != activeFg) {
-        // Clicking a different window (or taskbar): save current window's pinyin buffer
-        // before foreground change arrives so Alt+Tab or clicking back restores it.
-        saveWindowAscii(activeFg);
-        appAscii_.clear();
-    } else if (inClient) {
-        // Clicking inside the active window's client area may reposition the caret.
-        appAscii_.clear();
-        if (activeFg) {
-            savedWindowAscii_.erase(activeFg);
-        }
-    }
-
-    if (hasActiveSession()) {
-        resetActiveSession();
-    }
-}
-
-void WinApp::onMouseUp(POINT pt) {
-    if (!mouseDownValid_) {
-        return;
-    }
-    const bool wasInClient = mouseDownInClient_;
-    const POINT downPt = mouseDownPt_;
-    mouseDownValid_ = false;
-    mouseDownInClient_ = false;
-    if (wasInClient &&
-        (std::abs(pt.x - downPt.x) > 4 || std::abs(pt.y - downPt.y) > 4)) {
-        selectionLikely_ = true;
-        appAscii_.clear();
-        if (lastFgWnd_) {
-            savedWindowAscii_.erase(lastFgWnd_);
-        }
-    }
+    resetActiveSession();
 }
 
 void WinApp::onTrigger() {
@@ -865,7 +837,7 @@ void WinApp::onTrigger() {
             }
         }
     }
-    activeAnchor_ = caret_.queryCaret(fg, lastClickPt_).rect;
+    activeAnchor_ = caret_.queryCaret(fg, std::nullopt).rect;
     auto snap = caret_.readSurrounding(fg);
 
     // 1. Active selection via UIA (including Ctrl+A select-all): convert selected text directly
@@ -884,9 +856,9 @@ void WinApp::onTrigger() {
     }
 
     // 1b. Active selection in non-UIA apps (WeChat, Notepad3/Scintilla, WPS):
-    //     Only fire silent Ctrl+C when an explicit selection gesture occurred (Ctrl+A,
-    //     Shift+navigation, mouse drag, or double/triple-click) so Scintilla never
-    //     accidentally copies an unselected line.
+    //     Only fire silent Ctrl+C when an explicit keyboard selection gesture occurred
+    //     (Ctrl+A, Shift/Ctrl+Shift + navigation) so Scintilla never accidentally copies
+    //     an unselected line.
     if (selectionLikely_) {
         selectionLikely_ = false;
         if (auto clipSel = readSelectionViaClipboard(fg)) {
@@ -1165,6 +1137,7 @@ void WinApp::handleQueueKey(DWORD vk, char asciiCh) {
         const bool repSel = queue_.front().replaceSelection;
         client_.cancelSentence();
         queue_.pop_front();
+        syncPollTimer();
         // If text is already in the app and equals fallback, just close without rewriting!
         if ((eraseChars > 0 && fallback == eraseSuffix) || repSel) {
             activeSessionAtomic_.store(hasActiveSession());
@@ -1204,6 +1177,7 @@ void WinApp::handleCandidateKey(DWORD vk, bool shift, bool ctrl, char asciiCh) {
         draftReplaceSelection_ = pc.replaceSelection;
         draftActive_ = true;
         pendingCandidates_.reset();
+        syncPollTimer();
         activeSessionAtomic_.store(true);
         refreshOverlay();
         return;
@@ -1289,6 +1263,7 @@ void WinApp::submitSentence(std::string query, std::size_t pendingEraseChars,
     });
     activeSessionAtomic_.store(true);
     pollQueue();
+    syncPollTimer();
     refreshOverlay();
 }
 
@@ -1349,6 +1324,7 @@ void WinApp::startLoadMoreCandidates() {
     pc.loadingMore = true;
     pc.statusNote.clear();
     client_.startMoreCandidates(pc.query, pc.sessionTurns, pc.sentRev);
+    syncPollTimer();
     refreshOverlay();
 }
 
@@ -1361,9 +1337,11 @@ void WinApp::commitPendingCandidate(int globalIndex) {
     if (pc.loadingMore) {
         client_.cancelSentence();
     }
+    syncPollTimer();
     activeSessionAtomic_.store(hasActiveSession());
     if (!hasActiveSession()) {
         overlay_.hide();
+        syncMouseHook(false);
     }
     if (pc.candidates.empty()) {
         refreshOverlay();
@@ -1386,6 +1364,7 @@ void WinApp::commitSentenceResult(std::string committed, std::string turnJson,
     selectionLikely_ = false;
     if (!hasActiveSession()) {
         overlay_.hide();
+        syncMouseHook(false);
     }
     HWND fg = lastFgWnd_ ? lastFgWnd_ : ::GetForegroundWindow();
     if (fg) {
@@ -1446,36 +1425,112 @@ void WinApp::commitSentenceResult(std::string committed, std::string turnJson,
     }
     lastCommittedText_ = committed;
     lastCommitUsec_ = monotonicNowUsec();
+    if (config_.historyEnabled && historyDraft_) {
+        schedulePostCommitSync();
+    }
 }
 
-void WinApp::pollTimers() {
-    pollQueue();
-    pollCompaction();
-
-    // Deferred persistence to disk (idle + max interval)
-    if (historyDirty_) {
-        const std::uint64_t now = monotonicNowUsec();
-        const std::uint64_t idleUsec =
-            static_cast<std::uint64_t>(std::max(1, config_.persistIdleSeconds)) * 1000000ULL;
-        const std::uint64_t maxUsec =
-            static_cast<std::uint64_t>(std::max(1, config_.persistMaxSeconds)) * 1000000ULL;
-        if ((now >= historyLastMutatedUsec_ && now - historyLastMutatedUsec_ >= idleUsec) ||
-            (now >= historyDirtySinceUsec_ && now - historyDirtySinceUsec_ >= maxUsec)) {
-            flushHistoryToDisk();
-        }
+void WinApp::syncPollTimer() {
+    if (!ctrlHwnd_) {
+        return;
     }
+    const bool need =
+        (!queue_.empty() && !queue_.front().error.has_value()) ||
+        (pendingCandidates_ && pendingCandidates_->loadingMore);
+    if (need && !pollTimerActive_) {
+        ::SetTimer(ctrlHwnd_, kTimerPollId, kPollIntervalMs, nullptr);
+        pollTimerActive_ = true;
+    } else if (!need && pollTimerActive_) {
+        ::KillTimer(ctrlHwnd_, kTimerPollId);
+        pollTimerActive_ = false;
+    }
+}
 
-    // Periodically sync awaiting GUI draft after commit so edits via other IMEs get captured
-    if (config_.historyEnabled && historyDraft_ && lastCommitUsec_ > 0) {
-        const std::uint64_t now = monotonicNowUsec();
-        if (now - lastCommitUsec_ >= 250000ULL && now - lastCommitUsec_ <= 400000ULL) {
-            HWND fg = ::GetForegroundWindow();
-            if (fg == lastFgWnd_) {
-                if (auto snap = caret_.readSurrounding(fg)) {
-                    if (history_.update(historyDraft_, snap, ++historyRevision_)) {
-                        onHistoryMutated();
-                    }
-                }
+void WinApp::syncCompactionTimer() {
+    if (!ctrlHwnd_) {
+        return;
+    }
+    const bool need = config_.historyEnabled && history_.compacting();
+    if (need && !compactionTimerActive_) {
+        ::SetTimer(ctrlHwnd_, kTimerCompactionId, kCompactionIntervalMs, nullptr);
+        compactionTimerActive_ = true;
+    } else if (!need && compactionTimerActive_) {
+        ::KillTimer(ctrlHwnd_, kTimerCompactionId);
+        compactionTimerActive_ = false;
+    }
+}
+
+void WinApp::schedulePersistTimer() {
+    if (!ctrlHwnd_) {
+        return;
+    }
+    if (!historyDirty_ || !config_.historyEnabled || historyPath_.empty()) {
+        if (persistTimerActive_) {
+            ::KillTimer(ctrlHwnd_, kTimerPersistId);
+            persistTimerActive_ = false;
+        }
+        return;
+    }
+    const std::uint64_t now = monotonicNowUsec();
+    const std::uint64_t idleUsec =
+        static_cast<std::uint64_t>(std::max(1, config_.persistIdleSeconds)) * 1000000ULL;
+    const std::uint64_t maxUsec =
+        static_cast<std::uint64_t>(std::max(1, config_.persistMaxSeconds)) * 1000000ULL;
+    const std::uint64_t due =
+        std::min(historyLastMutatedUsec_ + idleUsec, historyDirtySinceUsec_ + maxUsec);
+    const std::uint64_t remUsec = (due > now) ? (due - now) : 0;
+    const UINT delayMs = static_cast<UINT>(
+        std::clamp<std::uint64_t>((remUsec + 999ULL) / 1000ULL, 50ULL, 86400000ULL));
+    ::SetTimer(ctrlHwnd_, kTimerPersistId, delayMs, nullptr);
+    persistTimerActive_ = true;
+}
+
+void WinApp::schedulePostCommitSync() {
+    if (!ctrlHwnd_) {
+        return;
+    }
+    ::SetTimer(ctrlHwnd_, kTimerPostCommitId, kPostCommitSyncMs, nullptr);
+    postCommitTimerActive_ = true;
+}
+
+void WinApp::cancelPostCommitSync() {
+    if (ctrlHwnd_ && postCommitTimerActive_) {
+        ::KillTimer(ctrlHwnd_, kTimerPostCommitId);
+    }
+    postCommitTimerActive_ = false;
+}
+
+void WinApp::onPersistTimer() {
+    if (ctrlHwnd_ && persistTimerActive_) {
+        ::KillTimer(ctrlHwnd_, kTimerPersistId);
+    }
+    persistTimerActive_ = false;
+    if (!historyDirty_ || !config_.historyEnabled) {
+        return;
+    }
+    const std::uint64_t now = monotonicNowUsec();
+    const std::uint64_t idleUsec =
+        static_cast<std::uint64_t>(std::max(1, config_.persistIdleSeconds)) * 1000000ULL;
+    const std::uint64_t maxUsec =
+        static_cast<std::uint64_t>(std::max(1, config_.persistMaxSeconds)) * 1000000ULL;
+    if ((now >= historyLastMutatedUsec_ && now - historyLastMutatedUsec_ >= idleUsec) ||
+        (now >= historyDirtySinceUsec_ && now - historyDirtySinceUsec_ >= maxUsec)) {
+        flushHistoryToDisk();
+    } else {
+        schedulePersistTimer();
+    }
+}
+
+void WinApp::onPostCommitSyncTimer() {
+    cancelPostCommitSync();
+    if (!config_.historyEnabled || !historyDraft_ || lastCommitUsec_ == 0) {
+        return;
+    }
+    HWND fg = ::GetForegroundWindow();
+    if (fg == lastFgWnd_) {
+        if (auto snap = caret_.readSurrounding(fg)) {
+            if (history_.update(historyDraft_, snap, ++historyRevision_)) {
+                onHistoryMutated();
             }
         }
     }
@@ -1509,17 +1564,20 @@ void WinApp::pollQueue() {
                 pc.statusNote = "·";
             }
             client_.cancelSentence();
+            syncPollTimer();
             refreshOverlay();
         } else if (snap.state == yuntype::JobState::Error) {
             pc.loadingMore = false;
             pc.statusNote = "!";
             client_.cancelSentence();
+            syncPollTimer();
             refreshOverlay();
         }
         return;
     }
 
     if (queue_.empty()) {
+        syncPollTimer();
         return;
     }
 
@@ -1533,6 +1591,7 @@ void WinApp::pollQueue() {
             queue_.pop_front();
             activeSessionAtomic_.store(hasActiveSession());
             commitSentenceResult(std::move(out), {}, 0, {}, false, eraseChars, eraseSuffix, repSel);
+            syncPollTimer();
             refreshOverlay();
             return;
         }
@@ -1540,6 +1599,7 @@ void WinApp::pollQueue() {
         const bool candMode = yuntype::shouldRequestCandidates(client_.config(), front.query);
         const auto ctx = buildHistoryContext(candMode);
         client_.startSentence(front.query, front.fallback, ctx);
+        syncPollTimer();
         refreshOverlay();
         return;
     }
@@ -1554,6 +1614,7 @@ void WinApp::pollQueue() {
     if (snap.state == yuntype::JobState::Error) {
         front.error = snap.error.empty() ? "请求失败" : snap.error;
         client_.cancelSentence();
+        syncPollTimer();
         refreshOverlay();
         return;
     }
@@ -1586,12 +1647,14 @@ void WinApp::pollQueue() {
             }
             pendingCandidates_ = std::move(pc);
             activeSessionAtomic_.store(true);
+            syncPollTimer();
             refreshOverlay();
         } else {
             const std::string committed = !cands.empty() ? cands.front() : finalText;
             activeSessionAtomic_.store(hasActiveSession());
             commitSentenceResult(committed, candMode ? std::string{} : std::move(turnJson),
                                  sentRev, {}, candMode, eraseChars, eraseSuffix, repSel);
+            syncPollTimer();
             refreshOverlay();
         }
     }
@@ -1599,6 +1662,7 @@ void WinApp::pollQueue() {
 
 void WinApp::pollCompaction() {
     if (!config_.historyEnabled) {
+        syncCompactionTimer();
         return;
     }
     if (history_.compactionStale()) {
@@ -1608,6 +1672,7 @@ void WinApp::pollCompaction() {
     if (history_.compacting()) {
         auto [state, summary] = client_.pollCompaction();
         if (state == yuntype::JobState::Running) {
+            syncCompactionTimer();
             return;
         }
         if (state == yuntype::JobState::Idle) {
@@ -1627,6 +1692,7 @@ void WinApp::pollCompaction() {
         std::string batch = history_.beginCompaction(budget);
         client_.startCompaction(batch, history_.summary());
     }
+    syncCompactionTimer();
 }
 
 void WinApp::refreshOverlay() {
@@ -1672,10 +1738,12 @@ void WinApp::refreshOverlay() {
         }
     } else {
         overlay_.hide();
+        syncMouseHook(false);
         return;
     }
 
     overlay_.update(model, activeAnchor_);
+    syncMouseHook(overlay_.isVisible());
 }
 
 void WinApp::resetActiveSession() {
@@ -1691,7 +1759,9 @@ void WinApp::resetActiveSession() {
     pendingCandidates_.reset();
     activeSessionAtomic_.store(false);
     lastTriggerTickMs_.store(0);
+    syncPollTimer();
     overlay_.hide();
+    syncMouseHook(false);
 }
 
 } // namespace yuntype::win
